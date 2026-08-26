@@ -60,7 +60,7 @@ set -Eeuo pipefail
 #   HOSTNAME=host \
 #   TIMEZONE=America/Bahia \
 #   SWAP_GB=32 \
-#   ./install-void-secure-btrfs-final.sh
+#   ./install-void-secure-btrfs.sh
 #
 # SWAP_GB defaults to installed RAM rounded up to the next GiB.
 
@@ -216,6 +216,8 @@ mount -o "${BTRFS_OPTS},subvol=@home" \
 
 mount -o "${BTRFS_OPTS},subvol=@var" \
     /dev/mapper/cryptroot "$MNT/var"
+
+mkdir -p "$MNT/var/.snapshots"
 
 mount -o "${BTRFS_OPTS},subvol=@snapshots" \
     /dev/mapper/cryptroot "$MNT/.snapshots"
