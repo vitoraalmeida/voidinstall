@@ -45,10 +45,10 @@ set -Eeuo pipefail
 # The live environment must already have Internet access.
 
 DISK="${DISK:-/dev/nvme0n1}"
-USERNAME="${USERNAME:-user}"neovim void linuxneovim void linux
+USERNAME="${USERNAME:-user}"
 HOSTNAME="${HOSTNAME:-host}"
 TIMEZONE="${TIMEZONE:-America/Bahia}"
-REPO="${REPO:-https://repo-fastly.voidlinux.org/current}"
+REPO="${REPO:-https://void.voidbr.org/voidlinux/}"
 MNT="${MNT:-/mnt}"
 
 die() {
