@@ -1,78 +1,100 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# Void Linux secure base installer for Lenovo ThinkPad P1 Gen 2.
+# Secure Void Linux base installer
+# Target: Lenovo ThinkPad P1 Gen 2 / x86_64 glibc / UEFI
 #
-# DESIGN
-# ──────
+# REQUIREMENTS IMPLEMENTED
+# ------------------------
+# - Void Linux x86_64 glibc, no desktop
+# - UEFI
+# - Custom Secure Boot with locally generated PK/KEK/db keys
+# - Only the EFI System Partition is plaintext
+# - LUKS1 for the whole Linux system
+# - /boot inside LUKS1
+# - Btrfs explicit subvolumes:
+#       @               -> /
+#       @home           -> /home
+#       @var            -> /var
+#       @snapshots      -> /.snapshots
+#       @var_snapshots  -> /var/.snapshots
+#       @swap           -> /swap
+# - Snapper
+# - Paired / + /var snapshots (XBPS state lives under /var/db/xbps)
+# - Automatic hourly paired snapshots with retention
+# - Encrypted Btrfs swapfile for hibernation
+# - resume + resume_offset configured
+# - NetworkManager for Ethernet and Wi-Fi
+# - PT-BR ThinkPad keyboard, including / and ? physical key
+# - vim, git, rsync
+#
+# SECURITY MODEL
+# --------------
 # GPT
-# ├── EFI System Partition (FAT32, unencrypted)
+# ├── ESP (FAT32, plaintext)
 # │   ├── signed standalone GRUB EFI
-# │   └── PUBLIC Secure Boot enrollment material
+# │   └── PUBLIC Secure Boot enrollment files
 # └── LUKS1
 #     └── Btrfs
-#         ├── @      -> /
-#         │            /boot lives HERE, encrypted
-#         ├── @home  -> /home
-#         └── @var   -> /var
+#         ├── encrypted /boot, kernel, initramfs and grub.cfg
+#         ├── separate root/home/var/snapshot subvolumes
+#         └── encrypted hibernation swapfile
 #
-# Security properties:
-#   * Only the ESP is plaintext.
-#   * /boot, kernel, initramfs and grub.cfg live inside LUKS1.
-#   * GRUB EFI is a standalone image containing the modules/config required
-#     to unlock LUKS and is signed with a locally generated Secure Boot db key.
-#   * PK, KEK and db key pairs are generated; private keys stay inside LUKS.
-#   * Public enrollment files are copied to the ESP for UEFI Custom Mode.
-#   * A random LUKS key is embedded in the encrypted initramfs so the passphrase
-#     is entered once at GRUB, not a second time in the initramfs.
+# The firmware verifies the signed standalone GRUB EFI image.
+# GRUB contains the modules and early config needed to unlock LUKS1.
+# Kernel, initramfs and grub.cfg stay inside encrypted /boot.
 #
 # IMPORTANT:
-#   Secure Boot key enrollment, UEFI Supervisor Password, and disabling external
-#   boot must be completed manually in ThinkPad Setup after installation.
+# - First boot with Secure Boot DISABLED.
+# - After validating the installation, back up /root/secureboot-keys to
+#   encrypted offline media.
+# - Then enroll PK/KEK/db in ThinkPad UEFI Custom Secure Boot mode.
+# - Set a UEFI Supervisor Password and disable external boot when not needed.
 #
-# WARNING: THIS SCRIPT DESTROYS ALL DATA ON DISK.
+# WARNING: THIS SCRIPT ERASES THE ENTIRE TARGET DISK.
 #
-# Run from the official Void x86_64 glibc live ISO, booted in UEFI mode:
+# Usage from official Void x86_64 glibc live ISO booted in UEFI mode:
 #
 #   DISK=/dev/nvme0n1 \
-#   USERNAME=vitor \
-#   HOSTNAME=p1 \
-#   ./install-void-secure-btrfs.sh
+#   USERNAME=user \
+#   HOSTNAME=host \
+#   TIMEZONE=America/Bahia \
+#   SWAP_GB=32 \
+#   ./install-void-secure-btrfs-final.sh
 #
-# Optional:
-#   TIMEZONE=America/Bahia
-#
-# The live environment must already have Internet access.
+# SWAP_GB defaults to installed RAM rounded up to the next GiB.
 
 DISK="${DISK:-/dev/nvme0n1}"
 USERNAME="${USERNAME:-user}"
 HOSTNAME="${HOSTNAME:-host}"
 TIMEZONE="${TIMEZONE:-America/Bahia}"
-REPO="${REPO:-https://void.voidbr.org/voidlinux/}"
+REPO="${REPO:-https://repo-default.voidlinux.org/current}"
 MNT="${MNT:-/mnt}"
+SWAP_GB="${SWAP_GB:-}"
 
-die() {
-    printf 'ERROR: %s\n' "$*" >&2
-    exit 1
-}
+log()  { printf '\n==> %s\n' "$*"; }
+warn() { printf '\nWARNING: %s\n' "$*" >&2; }
+die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
-log() {
-    printf '\n==> %s\n' "$*"
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command missing: $1"
 }
 
 cleanup() {
-    set +e
-    sync
+    sync || true
 }
 trap cleanup EXIT
 
-[[ $EUID -eq 0 ]] || die "Run this script as root."
-[[ -b "$DISK" ]] || die "Disk does not exist: $DISK"
+[[ $EUID -eq 0 ]] || die "Run this installer as root."
+[[ "$(uname -m)" == "x86_64" ]] || die "This installer targets x86_64."
 [[ -d /sys/firmware/efi ]] || die "Boot the live ISO in UEFI mode."
-[[ "$(uname -m)" == "x86_64" ]] || die "This script targets x86_64."
-command -v xbps-install >/dev/null || die "xbps-install unavailable."
-command -v cryptsetup >/dev/null || die "cryptsetup unavailable."
-command -v parted >/dev/null || die "parted unavailable."
+[[ -b "$DISK" ]] || die "Target disk does not exist: $DISK"
+
+for cmd in \
+    xbps-install cryptsetup parted wipefs mkfs.vfat mkfs.btrfs \
+    btrfs blkid mount umount chroot udevadm partprobe lsblk; do
+    require_cmd "$cmd"
+done
 
 case "$USERNAME" in
     ''|*[!a-z0-9_-]*|[0-9]*) die "Invalid USERNAME: $USERNAME" ;;
@@ -82,6 +104,14 @@ case "$HOSTNAME" in
     ''|*[!a-zA-Z0-9.-]*) die "Invalid HOSTNAME: $HOSTNAME" ;;
 esac
 
+if [[ -z "$SWAP_GB" ]]; then
+    MEM_KIB="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
+    SWAP_GB="$(( (MEM_KIB + 1048575) / 1048576 ))"
+fi
+
+[[ "$SWAP_GB" =~ ^[0-9]+$ ]] || die "SWAP_GB must be an integer."
+(( SWAP_GB >= 2 )) || die "SWAP_GB must be at least 2 GiB."
+
 if [[ "$DISK" =~ (nvme|mmcblk) ]]; then
     ESP="${DISK}p1"
     CRYPT="${DISK}p2"
@@ -90,31 +120,42 @@ else
     CRYPT="${DISK}2"
 fi
 
-# Refresh live repository metadata before touching the disk.
-log "Refreshing repository metadata"
+log "Refreshing live repository metadata"
 xbps-install -S
 
 printf '\n'
-printf 'SECURE VOID INSTALLATION\n'
-printf '========================\n'
-printf 'THIS WILL ERASE: %s\n\n' "$DISK"
+printf '============================================================\n'
+printf ' SECURE VOID LINUX INSTALLER\n'
+printf '============================================================\n\n'
+printf 'Target disk: %s\n' "$DISK"
+printf 'User:        %s\n' "$USERNAME"
+printf 'Hostname:    %s\n' "$HOSTNAME"
+printf 'Swap:        %s GiB\n' "$SWAP_GB"
+printf 'Timezone:    %s\n\n' "$TIMEZONE"
 printf 'Layout:\n'
-printf '  EFI    1 GiB      FAT32, plaintext, signed bootloader only\n'
-printf '  LUKS1  remaining  Btrfs\n'
-printf '                    @      -> / (includes encrypted /boot)\n'
-printf '                    @home  -> /home\n'
-printf '                    @var   -> /var\n\n'
-lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS "$DISK" || true
-printf '\nType exactly: ERASE %s\n> ' "$DISK"
-read -r confirmation
-[[ "$confirmation" == "ERASE $DISK" ]] || die "Confirmation did not match. Nothing changed."
+printf '  ESP      1 GiB      FAT32, plaintext\n'
+printf '  LUKS1    remaining  Btrfs\n'
+printf '    @               -> /\n'
+printf '    @home           -> /home\n'
+printf '    @var            -> /var\n'
+printf '    @snapshots      -> /.snapshots\n'
+printf '    @var_snapshots  -> /var/.snapshots\n'
+printf '    @swap           -> /swap\n\n'
 
-log "Unmounting old target state"
+lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS "$DISK" || true
+
+printf '\nTHIS WILL ERASE ALL DATA ON %s.\n' "$DISK"
+printf 'Type exactly: ERASE %s\n> ' "$DISK"
+read -r confirmation
+[[ "$confirmation" == "ERASE $DISK" ]] ||
+    die "Confirmation did not match. No destructive action was performed."
+
+log "Cleaning previous mounts/mappings"
 swapoff -a 2>/dev/null || true
 umount -R "$MNT" 2>/dev/null || true
 cryptsetup close cryptroot 2>/dev/null || true
 
-log "Creating GPT: ESP + encrypted system"
+log "Creating GPT: ESP + one encrypted system partition"
 wipefs -af "$DISK"
 parted -s "$DISK" \
     mklabel gpt \
@@ -125,7 +166,8 @@ parted -s "$DISK" \
 partprobe "$DISK"
 udevadm settle
 
-[[ -b "$ESP" && -b "$CRYPT" ]] || die "Partitions were not created correctly."
+[[ -b "$ESP" && -b "$CRYPT" ]] ||
+    die "Expected partitions were not created."
 
 log "Formatting EFI System Partition"
 mkfs.vfat -F32 -n EFI "$ESP"
@@ -135,49 +177,98 @@ printf '\nChoose a strong disk-encryption passphrase.\n'
 cryptsetup luksFormat --type luks1 "$CRYPT"
 cryptsetup open "$CRYPT" cryptroot
 
-log "Creating Btrfs filesystem and subvolumes"
+log "Creating Btrfs filesystem"
 mkfs.btrfs -f -L voidroot /dev/mapper/cryptroot
+
+log "Creating explicit Btrfs subvolumes"
 mount /dev/mapper/cryptroot "$MNT"
-btrfs subvolume create "$MNT/@"
-btrfs subvolume create "$MNT/@home"
-btrfs subvolume create "$MNT/@var"
+
+for subvol in \
+    @ \
+    @home \
+    @var \
+    @snapshots \
+    @var_snapshots \
+    @swap
+do
+    btrfs subvolume create "$MNT/$subvol"
+done
+
 umount "$MNT"
 
-BTRFS_OPTS="noatime,compress=zstd:3,ssd,discard=async,space_cache=v2"
+# Keep mount options conservative and portable.
+BTRFS_OPTS="noatime,compress=zstd:3"
 
-mount -o "${BTRFS_OPTS},subvol=@" /dev/mapper/cryptroot "$MNT"
-mkdir -p "$MNT"/{home,var,boot/efi}
-mount -o "${BTRFS_OPTS},subvol=@home" /dev/mapper/cryptroot "$MNT/home"
-mount -o "${BTRFS_OPTS},subvol=@var" /dev/mapper/cryptroot "$MNT/var"
+log "Mounting target filesystem"
+mount -o "${BTRFS_OPTS},subvol=@" \
+    /dev/mapper/cryptroot "$MNT"
+
+mkdir -p \
+    "$MNT/home" \
+    "$MNT/var" \
+    "$MNT/.snapshots" \
+    "$MNT/var/.snapshots" \
+    "$MNT/swap" \
+    "$MNT/boot/efi"
+
+mount -o "${BTRFS_OPTS},subvol=@home" \
+    /dev/mapper/cryptroot "$MNT/home"
+
+mount -o "${BTRFS_OPTS},subvol=@var" \
+    /dev/mapper/cryptroot "$MNT/var"
+
+mount -o "${BTRFS_OPTS},subvol=@snapshots" \
+    /dev/mapper/cryptroot "$MNT/.snapshots"
+
+mount -o "${BTRFS_OPTS},subvol=@var_snapshots" \
+    /dev/mapper/cryptroot "$MNT/var/.snapshots"
+
+# Swap is deliberately a separate subvolume and is not compressed/snapshotted.
+mount -o "noatime,subvol=@swap" \
+    /dev/mapper/cryptroot "$MNT/swap"
+
 mount "$ESP" "$MNT/boot/efi"
+
+log "Creating encrypted Btrfs swapfile for hibernation"
+btrfs filesystem mkswapfile -s "${SWAP_GB}g" "$MNT/swap/swapfile"
+chmod 600 "$MNT/swap/swapfile"
+
+RESUME_OFFSET="$(
+    btrfs inspect-internal map-swapfile -r "$MNT/swap/swapfile"
+)"
+[[ "$RESUME_OFFSET" =~ ^[0-9]+$ ]] ||
+    die "Unable to calculate Btrfs resume_offset."
 
 log "Bootstrapping Void Linux"
 mkdir -p "$MNT/var/db/xbps/keys"
 cp /var/db/xbps/keys/* "$MNT/var/db/xbps/keys/"
 
-# efitools creates PK/KEK/db enrollment objects.
-# sbsigntool signs the standalone GRUB EFI image.
-XBPS_ARCH=x86_64 xbps-install -Sy -r "$MNT" -R "$REPO" \
+XBPS_ARCH=x86_64 xbps-install -Sy \
+    -r "$MNT" \
+    -R "$REPO" \
     base-system \
     cryptsetup \
     grub-x86_64-efi \
     efibootmgr \
     efitools \
+    efitools-efi \
     sbsigntool \
     openssl \
     NetworkManager \
     dbus \
+    snapper \
+    cronie \
+    xkeyboard-config \
     vim \
     git \
-    snapper \
-    xtools \
-    xkeyboard-config
+    rsync
 
 log "Binding pseudo-filesystems for chroot"
 for fs in dev proc sys; do
     mount --rbind "/$fs" "$MNT/$fs"
     mount --make-rslave "$MNT/$fs"
 done
+
 mount --bind /run "$MNT/run"
 mount --make-rslave "$MNT/run"
 
@@ -185,21 +276,32 @@ BTRFS_UUID="$(blkid -s UUID -o value /dev/mapper/cryptroot)"
 ESP_UUID="$(blkid -s UUID -o value "$ESP")"
 LUKS_UUID="$(cryptsetup luksUUID "$CRYPT")"
 
-log "Writing fstab and crypttab"
+[[ -n "$BTRFS_UUID" && -n "$ESP_UUID" && -n "$LUKS_UUID" ]] ||
+    die "Unable to determine filesystem UUIDs."
+
+log "Writing fstab"
 cat > "$MNT/etc/fstab" <<EOF
-# <file system>  <mount point>  <type>  <options>  <dump> <pass>
-UUID=$BTRFS_UUID  /          btrfs  ${BTRFS_OPTS},subvol=@      0 0
-UUID=$BTRFS_UUID  /home      btrfs  ${BTRFS_OPTS},subvol=@home  0 0
-UUID=$BTRFS_UUID  /var       btrfs  ${BTRFS_OPTS},subvol=@var   0 0
-UUID=$ESP_UUID    /boot/efi  vfat   umask=0077                  0 2
+# filesystem          mountpoint       type   options                              dump pass
+UUID=$BTRFS_UUID      /                btrfs  ${BTRFS_OPTS},subvol=@               0 0
+UUID=$BTRFS_UUID      /home            btrfs  ${BTRFS_OPTS},subvol=@home           0 0
+UUID=$BTRFS_UUID      /var             btrfs  ${BTRFS_OPTS},subvol=@var            0 0
+UUID=$BTRFS_UUID      /.snapshots      btrfs  ${BTRFS_OPTS},subvol=@snapshots      0 0
+UUID=$BTRFS_UUID      /var/.snapshots  btrfs  ${BTRFS_OPTS},subvol=@var_snapshots  0 0
+UUID=$BTRFS_UUID      /swap            btrfs  noatime,subvol=@swap                 0 0
+UUID=$ESP_UUID        /boot/efi        vfat   umask=0077                           0 2
+/swap/swapfile        none             swap   defaults                             0 0
 EOF
 
-log "Creating encrypted initramfs LUKS key"
-# The key is stored under /boot, which itself is inside LUKS.
-# It is also embedded in initramfs. Therefore an offline attacker cannot read it.
+log "Creating second LUKS key for one-passphrase boot"
+# GRUB asks for the human passphrase. The initramfs, which is itself stored
+# inside encrypted /boot, contains this random key and reopens the root mapping
+# without asking for the passphrase a second time.
 install -d -m 0700 "$MNT/boot"
-dd if=/dev/urandom of="$MNT/boot/volume.key" bs=64 count=1 status=none
+dd if=/dev/urandom \
+    of="$MNT/boot/volume.key" \
+    bs=64 count=1 status=none
 chmod 000 "$MNT/boot/volume.key"
+
 cryptsetup luksAddKey "$CRYPT" "$MNT/boot/volume.key"
 
 cat > "$MNT/etc/crypttab" <<EOF
@@ -214,8 +316,9 @@ LANG=pt_BR.UTF-8
 LC_COLLATE=C
 EOF
 
-grep -q '^pt_BR.UTF-8 UTF-8' "$MNT/etc/default/libc-locales" 2>/dev/null ||
+if ! grep -q '^pt_BR.UTF-8 UTF-8' "$MNT/etc/default/libc-locales"; then
     printf '\npt_BR.UTF-8 UTF-8\n' >> "$MNT/etc/default/libc-locales"
+fi
 
 ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$MNT/etc/localtime"
 chroot "$MNT" xbps-reconfigure -f glibc-locales
@@ -227,25 +330,23 @@ else
     printf '\nKEYMAP=br-abnt2\n' >> "$MNT/etc/rc.conf"
 fi
 
-# Lenovo Brazilian ThinkPads expose the physical /? key as Linux keycode 97
-# (Right Ctrl). This makes it slash and Shift+slash question mark in the TTY.
+# Brazilian IBM/Lenovo ThinkPads expose the physical /? key as RCtrl/keycode 97.
 cat > "$MNT/etc/thinkpad-br.map" <<'EOF'
 keycode 97 = slash question
 EOF
 
 touch "$MNT/etc/rc.local"
-if ! grep -q 'thinkpad-br.map' "$MNT/etc/rc.local"; then
+if ! grep -q '/etc/thinkpad-br.map' "$MNT/etc/rc.local"; then
     cat >> "$MNT/etc/rc.local" <<'EOF'
 
-# Brazilian ThinkPad physical /? key.
+# Brazilian ThinkPad /? physical key.
 if [ -r /etc/thinkpad-br.map ]; then
     loadkeys /etc/thinkpad-br.map
 fi
 EOF
 fi
-chmod +x "$MNT/etc/rc.local"
+chmod 755 "$MNT/etc/rc.local"
 
-# Future Wayland/XKB sessions (including Niri) can inherit this.
 mkdir -p "$MNT/etc/profile.d"
 cat > "$MNT/etc/profile.d/thinkpad-xkb.sh" <<'EOF'
 export XKB_DEFAULT_LAYOUT=br
@@ -253,15 +354,33 @@ export XKB_DEFAULT_VARIANT=thinkpad
 EOF
 chmod 644 "$MNT/etc/profile.d/thinkpad-xkb.sh"
 
-log "Configuring wired and Wi-Fi networking"
-rm -f "$MNT/var/service/dhcpcd" "$MNT/var/service/wpa_supplicant"
+log "Configuring Ethernet and Wi-Fi through NetworkManager"
+# NetworkManager is the sole network-management service.
+rm -f \
+    "$MNT/var/service/dhcpcd" \
+    "$MNT/var/service/wpa_supplicant"
+
 mkdir -p "$MNT/var/service"
-ln -sfn /etc/sv/dbus "$MNT/var/service/dbus"
-ln -sfn /etc/sv/NetworkManager "$MNT/var/service/NetworkManager"
+
+ln -sfn /etc/sv/dbus \
+    "$MNT/var/service/dbus"
+
+ln -sfn /etc/sv/NetworkManager \
+    "$MNT/var/service/NetworkManager"
+
+ln -sfn /etc/sv/cronie \
+    "$MNT/var/service/cronie"
+
+ln -sfn /etc/sv/snapperd \
+    "$MNT/var/service/snapperd"
 
 log "Creating administrative user: $USERNAME"
 if ! chroot "$MNT" id "$USERNAME" >/dev/null 2>&1; then
-    chroot "$MNT" useradd -m -s /bin/bash -G wheel,network,audio,video,input "$USERNAME"
+    chroot "$MNT" useradd \
+        -m \
+        -s /bin/bash \
+        -G wheel,network,audio,video,input \
+        "$USERNAME"
 fi
 
 mkdir -p "$MNT/etc/sudoers.d"
@@ -270,43 +389,167 @@ cat > "$MNT/etc/sudoers.d/10-wheel" <<'EOF'
 EOF
 chmod 440 "$MNT/etc/sudoers.d/10-wheel"
 
-printf '\nSet the ROOT password:\n'
+printf '\nSet ROOT password:\n'
 chroot "$MNT" passwd root
 
-printf '\nSet the password for %s:\n' "$USERNAME"
+printf '\nSet password for %s:\n' "$USERNAME"
 chroot "$MNT" passwd "$USERNAME"
 
-log "Configuring dracut for encrypted root"
+log "Configuring Snapper for explicit root and /var snapshot stores"
+mkdir -p "$MNT/etc/snapper/configs"
+
+cat > "$MNT/etc/snapper/configs/root" <<'EOF'
+SUBVOLUME="/"
+FSTYPE="btrfs"
+ALLOW_USERS=""
+ALLOW_GROUPS=""
+SYNC_ACL="no"
+BACKGROUND_COMPARISON="yes"
+
+NUMBER_CLEANUP="yes"
+NUMBER_MIN_AGE="1800"
+NUMBER_LIMIT="20"
+NUMBER_LIMIT_IMPORTANT="10"
+
+TIMELINE_CREATE="no"
+TIMELINE_CLEANUP="yes"
+TIMELINE_MIN_AGE="1800"
+TIMELINE_LIMIT_HOURLY="5"
+TIMELINE_LIMIT_DAILY="7"
+TIMELINE_LIMIT_WEEKLY="4"
+TIMELINE_LIMIT_MONTHLY="3"
+TIMELINE_LIMIT_QUARTERLY="0"
+TIMELINE_LIMIT_YEARLY="0"
+
+EMPTY_PRE_POST_CLEANUP="yes"
+EMPTY_PRE_POST_MIN_AGE="1800"
+EOF
+
+cat > "$MNT/etc/snapper/configs/var" <<'EOF'
+SUBVOLUME="/var"
+FSTYPE="btrfs"
+ALLOW_USERS=""
+ALLOW_GROUPS=""
+SYNC_ACL="no"
+BACKGROUND_COMPARISON="yes"
+
+NUMBER_CLEANUP="yes"
+NUMBER_MIN_AGE="1800"
+NUMBER_LIMIT="20"
+NUMBER_LIMIT_IMPORTANT="10"
+
+TIMELINE_CREATE="no"
+TIMELINE_CLEANUP="yes"
+TIMELINE_MIN_AGE="1800"
+TIMELINE_LIMIT_HOURLY="5"
+TIMELINE_LIMIT_DAILY="7"
+TIMELINE_LIMIT_WEEKLY="4"
+TIMELINE_LIMIT_MONTHLY="3"
+TIMELINE_LIMIT_QUARTERLY="0"
+TIMELINE_LIMIT_YEARLY="0"
+
+EMPTY_PRE_POST_CLEANUP="yes"
+EMPTY_PRE_POST_MIN_AGE="1800"
+EOF
+
+# Void's snapper package is built with configuration in /etc/conf.d.
+if grep -q '^SNAPPER_CONFIGS=' "$MNT/etc/conf.d/snapper"; then
+    sed -i 's/^SNAPPER_CONFIGS=.*/SNAPPER_CONFIGS="root var"/' \
+        "$MNT/etc/conf.d/snapper"
+else
+    printf '\nSNAPPER_CONFIGS="root var"\n' >> "$MNT/etc/conf.d/snapper"
+fi
+
+log "Installing paired system-snapshot helper"
+cat > "$MNT/usr/local/sbin/system-snapshot" <<'EOF'
+#!/bin/sh
+set -eu
+
+[ "$(id -u)" -eq 0 ] || {
+    echo "Run as root." >&2
+    exit 1
+}
+
+case "${1:-}" in
+    --timeline)
+        ID="$(date -u +%Y%m%dT%H%M%SZ)"
+        DESC="paired-timeline:$ID"
+
+        snapper -c root create \
+            --description "$DESC" \
+            --cleanup-algorithm timeline
+
+        snapper -c var create \
+            --description "$DESC" \
+            --cleanup-algorithm timeline
+
+        snapper -c root cleanup timeline
+        snapper -c var cleanup timeline
+        ;;
+
+    "")
+        echo "Usage: system-snapshot 'description' | --timeline" >&2
+        exit 2
+        ;;
+
+    *)
+        ID="$(date -u +%Y%m%dT%H%M%SZ)"
+        DESC="paired:$ID:$*"
+
+        snapper -c root create \
+            --description "$DESC" \
+            --cleanup-algorithm number
+
+        snapper -c var create \
+            --description "$DESC" \
+            --cleanup-algorithm number
+        ;;
+esac
+EOF
+chmod 755 "$MNT/usr/local/sbin/system-snapshot"
+
+mkdir -p "$MNT/etc/cron.hourly"
+cat > "$MNT/etc/cron.hourly/10-system-snapshot" <<'EOF'
+#!/bin/sh
+exec /usr/local/sbin/system-snapshot --timeline
+EOF
+chmod 755 "$MNT/etc/cron.hourly/10-system-snapshot"
+
+log "Configuring dracut for LUKS1, Btrfs and hibernation"
 mkdir -p "$MNT/etc/dracut.conf.d"
 cat > "$MNT/etc/dracut.conf.d/10-cryptroot.conf" <<'EOF'
-add_dracutmodules+=" crypt btrfs "
+add_dracutmodules+=" crypt btrfs resume "
 install_items+=" /boot/volume.key /etc/crypttab "
 hostonly="yes"
 EOF
 
-log "Configuring GRUB files inside encrypted /boot"
-cat >> "$MNT/etc/default/grub" <<EOF
+log "Configuring encrypted /boot and resume parameters"
+if grep -q '^GRUB_ENABLE_CRYPTODISK=' "$MNT/etc/default/grub"; then
+    sed -i 's/^GRUB_ENABLE_CRYPTODISK=.*/GRUB_ENABLE_CRYPTODISK=y/' \
+        "$MNT/etc/default/grub"
+else
+    printf '\nGRUB_ENABLE_CRYPTODISK=y\n' >> "$MNT/etc/default/grub"
+fi
 
-# Entire /boot is inside LUKS1.
-GRUB_ENABLE_CRYPTODISK=y
-EOF
+KERNEL_CMDLINE="loglevel=4 rd.luks.uuid=luks-$LUKS_UUID root=UUID=$BTRFS_UUID rootflags=subvol=@ resume=UUID=$BTRFS_UUID resume_offset=$RESUME_OFFSET rw"
 
 if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$MNT/etc/default/grub"; then
     sed -i \
-        "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"loglevel=4 rd.luks.uuid=luks-$LUKS_UUID root=UUID=$BTRFS_UUID rootflags=subvol=@ rw\"|" \
+        "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"$KERNEL_CMDLINE\"|" \
         "$MNT/etc/default/grub"
 else
-    printf 'GRUB_CMDLINE_LINUX_DEFAULT="loglevel=4 rd.luks.uuid=luks-%s root=UUID=%s rootflags=subvol=@ rw"\n' \
-        "$LUKS_UUID" "$BTRFS_UUID" >> "$MNT/etc/default/grub"
+    printf 'GRUB_CMDLINE_LINUX_DEFAULT="%s"\n' "$KERNEL_CMDLINE" \
+        >> "$MNT/etc/default/grub"
 fi
 
 chroot "$MNT" dracut --regenerate-all --force
 mkdir -p "$MNT/boot/grub"
 chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
 
-log "Generating local Secure Boot PK, KEK and db keys"
+log "Generating custom Secure Boot PK, KEK and db keys"
 KEYDIR="$MNT/root/secureboot-keys"
 PUBDIR="$MNT/boot/efi/EFI/keys"
+
 mkdir -p "$KEYDIR" "$PUBDIR"
 chmod 700 "$KEYDIR"
 
@@ -315,7 +558,9 @@ generate_key() {
     local cn="$2"
 
     openssl req \
-        -new -x509 -newkey rsa:4096 \
+        -new \
+        -x509 \
+        -newkey rsa:4096 \
         -subj "/CN=$cn/" \
         -keyout "$KEYDIR/$name.key" \
         -out "$KEYDIR/$name.crt" \
@@ -336,66 +581,69 @@ generate_key PK  "$HOSTNAME Secure Boot Platform Key"
 generate_key KEK "$HOSTNAME Secure Boot KEK"
 generate_key db  "$HOSTNAME Secure Boot db"
 
-# Produce EFI Signature Lists and authenticated update files.
-UUIDGEN="$(cat /proc/sys/kernel/random/uuid)"
-cert-to-efi-sig-list -g "$UUIDGEN" "$KEYDIR/PK.crt"  "$PUBDIR/PK.esl"
-cert-to-efi-sig-list -g "$UUIDGEN" "$KEYDIR/KEK.crt" "$PUBDIR/KEK.esl"
-cert-to-efi-sig-list -g "$UUIDGEN" "$KEYDIR/db.crt"  "$PUBDIR/db.esl"
+PK_GUID="$(cat /proc/sys/kernel/random/uuid)"
+KEK_GUID="$(cat /proc/sys/kernel/random/uuid)"
+DB_GUID="$(cat /proc/sys/kernel/random/uuid)"
+
+cert-to-efi-sig-list \
+    -g "$PK_GUID" \
+    "$KEYDIR/PK.crt" \
+    "$PUBDIR/PK.esl"
+
+cert-to-efi-sig-list \
+    -g "$KEK_GUID" \
+    "$KEYDIR/KEK.crt" \
+    "$PUBDIR/KEK.esl"
+
+cert-to-efi-sig-list \
+    -g "$DB_GUID" \
+    "$KEYDIR/db.crt" \
+    "$PUBDIR/db.esl"
 
 sign-efi-sig-list \
-    -k "$KEYDIR/PK.key" -c "$KEYDIR/PK.crt" \
+    -k "$KEYDIR/PK.key" \
+    -c "$KEYDIR/PK.crt" \
     PK "$PUBDIR/PK.esl" "$PUBDIR/PK.auth"
 
 sign-efi-sig-list \
-    -k "$KEYDIR/PK.key" -c "$KEYDIR/PK.crt" \
+    -k "$KEYDIR/PK.key" \
+    -c "$KEYDIR/PK.crt" \
     KEK "$PUBDIR/KEK.esl" "$PUBDIR/KEK.auth"
 
 sign-efi-sig-list \
-    -k "$KEYDIR/KEK.key" -c "$KEYDIR/KEK.crt" \
+    -k "$KEYDIR/KEK.key" \
+    -c "$KEYDIR/KEK.crt" \
     db "$PUBDIR/db.esl" "$PUBDIR/db.auth"
 
-cat > "$PUBDIR/README.txt" <<'EOF'
-These are PUBLIC Secure Boot enrollment files.
-
-Private signing keys are NOT stored on the EFI System Partition.
-They are under /root/secureboot-keys, which is inside LUKS.
-
-ThinkPad Setup:
-  Security -> Secure Boot
-  1. Set a Supervisor Password first.
-  2. Enter Custom/Setup Mode ("Reset to Setup Mode" / clear current keys).
-  3. Enroll your own PK, KEK and db using the files in this directory.
-  4. Enable Secure Boot.
-  5. Disable external/USB boot unless you intentionally need it.
-
-Keep an offline backup of the private keys before relying on this setup.
-EOF
-
-log "Building a standalone GRUB EFI that can unlock LUKS without external modules"
+log "Building signed standalone GRUB EFI"
 mkdir -p "$MNT/root/grub-build"
 
-# This configuration is embedded in grubx64.efi.
-# Because the disk contains a single LUKS volume, cryptomount -a is intentional.
 cat > "$MNT/root/grub-build/early.cfg" <<EOF
 set pager=1
 insmod part_gpt
 insmod cryptodisk
 insmod luks
 insmod gcry_rijndael
+insmod gcry_sha1
 insmod gcry_sha256
+insmod gcry_sha512
 insmod btrfs
+
 cryptomount -a
+
 search --fs-uuid --set=root $BTRFS_UUID
 set prefix=(\$root)/@/boot/grub
 configfile (\$root)/@/boot/grub/grub.cfg
 EOF
 
-mkdir -p "$MNT/boot/efi/EFI/Void" "$MNT/boot/efi/EFI/BOOT"
+mkdir -p \
+    "$MNT/boot/efi/EFI/Void" \
+    "$MNT/boot/efi/EFI/BOOT"
 
 chroot "$MNT" grub-mkstandalone \
     -O x86_64-efi \
     -o /root/grub-build/grubx64-unsigned.efi \
-    --modules="part_gpt cryptodisk luks gcry_rijndael gcry_sha256 btrfs normal configfile search search_fs_uuid linux all_video gfxterm echo reboot halt" \
+    --modules="part_gpt cryptodisk luks gcry_rijndael gcry_sha1 gcry_sha256 gcry_sha512 btrfs normal configfile search search_fs_uuid linux all_video gfxterm echo reboot halt" \
     "boot/grub/grub.cfg=/root/grub-build/early.cfg"
 
 sbsign \
@@ -407,7 +655,9 @@ sbsign \
 cp "$MNT/boot/efi/EFI/Void/grubx64.efi" \
    "$MNT/boot/efi/EFI/BOOT/BOOTX64.EFI"
 
-sbverify --cert "$KEYDIR/db.crt" "$MNT/boot/efi/EFI/Void/grubx64.efi" >/dev/null
+sbverify \
+    --cert "$KEYDIR/db.crt" \
+    "$MNT/boot/efi/EFI/Void/grubx64.efi" >/dev/null
 
 log "Creating UEFI boot entry"
 if ! chroot "$MNT" efibootmgr \
@@ -415,12 +665,12 @@ if ! chroot "$MNT" efibootmgr \
     --disk "$DISK" \
     --part 1 \
     --label "Void Linux" \
-    --loader '\EFI\Void\grubx64.efi'; then
-    printf 'WARNING: efibootmgr could not create an NVRAM entry.\n'
-    printf 'The signed fallback loader exists at EFI/BOOT/BOOTX64.EFI.\n'
+    --loader '\EFI\Void\grubx64.efi'
+then
+    warn "Could not create NVRAM entry; the signed fallback EFI/BOOT/BOOTX64.EFI exists."
 fi
 
-log "Installing Secure Boot GRUB refresh helper"
+log "Installing GRUB rebuild + re-sign helper"
 cat > "$MNT/usr/local/sbin/secureboot-refresh-grub" <<'EOF'
 #!/bin/sh
 set -eu
@@ -429,13 +679,22 @@ KEYDIR=/root/secureboot-keys
 ESP=/boot/efi
 BUILD=/root/grub-build
 
+[ "$(id -u)" -eq 0 ] || {
+    echo "Run as root." >&2
+    exit 1
+}
+
 [ -r "$KEYDIR/db.key" ] || {
-    echo "Missing $KEYDIR/db.key" >&2
+    echo "Missing Secure Boot db private key." >&2
     exit 1
 }
 
 BTRFS_UUID="$(findmnt -no UUID /)"
-mkdir -p "$BUILD" "$ESP/EFI/Void" "$ESP/EFI/BOOT"
+
+mkdir -p \
+    "$BUILD" \
+    "$ESP/EFI/Void" \
+    "$ESP/EFI/BOOT"
 
 grub-mkconfig -o /boot/grub/grub.cfg
 
@@ -445,9 +704,13 @@ insmod part_gpt
 insmod cryptodisk
 insmod luks
 insmod gcry_rijndael
+insmod gcry_sha1
 insmod gcry_sha256
+insmod gcry_sha512
 insmod btrfs
+
 cryptomount -a
+
 search --fs-uuid --set=root $BTRFS_UUID
 set prefix=(\$root)/@/boot/grub
 configfile (\$root)/@/boot/grub/grub.cfg
@@ -456,7 +719,7 @@ EOC
 grub-mkstandalone \
     -O x86_64-efi \
     -o "$BUILD/grubx64-unsigned.efi" \
-    --modules="part_gpt cryptodisk luks gcry_rijndael gcry_sha256 btrfs normal configfile search search_fs_uuid linux all_video gfxterm echo reboot halt" \
+    --modules="part_gpt cryptodisk luks gcry_rijndael gcry_sha1 gcry_sha256 gcry_sha512 btrfs normal configfile search search_fs_uuid linux all_video gfxterm echo reboot halt" \
     "boot/grub/grub.cfg=$BUILD/early.cfg"
 
 sbsign \
@@ -465,91 +728,184 @@ sbsign \
     --output "$ESP/EFI/Void/grubx64.efi" \
     "$BUILD/grubx64-unsigned.efi"
 
-cp "$ESP/EFI/Void/grubx64.efi" "$ESP/EFI/BOOT/BOOTX64.EFI"
-sbverify --cert "$KEYDIR/db.crt" "$ESP/EFI/Void/grubx64.efi"
-echo "Signed GRUB EFI refreshed."
+cp "$ESP/EFI/Void/grubx64.efi" \
+   "$ESP/EFI/BOOT/BOOTX64.EFI"
+
+sbverify \
+    --cert "$KEYDIR/db.crt" \
+    "$ESP/EFI/Void/grubx64.efi"
+
+echo "GRUB regenerated and signed."
 EOF
 chmod 700 "$MNT/usr/local/sbin/secureboot-refresh-grub"
 
-log "Configuring Snapper"
-# Root snapshots include encrypted /boot because /boot is part of @.
-# /home and /var are separate subvolumes and are intentionally excluded.
-if [[ ! -f "$MNT/etc/snapper/configs/root" ]]; then
-    chroot "$MNT" snapper -c root create-config /
-fi
-
-SNAPPER_CFG="$MNT/etc/snapper/configs/root"
-sed -i 's/^TIMELINE_CREATE=.*/TIMELINE_CREATE="no"/' "$SNAPPER_CFG" || true
-sed -i 's/^NUMBER_CLEANUP=.*/NUMBER_CLEANUP="yes"/' "$SNAPPER_CFG" || true
-sed -i 's/^NUMBER_MIN_AGE=.*/NUMBER_MIN_AGE="1800"/' "$SNAPPER_CFG" || true
-sed -i 's/^NUMBER_LIMIT=.*/NUMBER_LIMIT="20"/' "$SNAPPER_CFG" || true
-sed -i 's/^NUMBER_LIMIT_IMPORTANT=.*/NUMBER_LIMIT_IMPORTANT="10"/' "$SNAPPER_CFG" || true
-
+log "Installing snapshot-aware XBPS update wrapper"
 cat > "$MNT/usr/local/sbin/xbps-snapshot-update" <<'EOF'
 #!/bin/sh
 set -eu
 
+ID="$(date -u +%Y%m%dT%H%M%SZ)"
+PRE="xbps-pre:$ID"
+
 snapper -c root create \
-    --description "XBPS pre-update" \
+    --description "$PRE" \
     --cleanup-algorithm number
 
-xbps-install -Su
+snapper -c var create \
+    --description "$PRE" \
+    --cleanup-algorithm number
 
-# Kernel/initramfs/grub.cfg are inside the encrypted root.
-# Refresh the signed standalone EFI image as well in case GRUB changed.
+if ! xbps-install -Su; then
+    echo "XBPS update failed; pre-update snapshots were retained." >&2
+    exit 1
+fi
+
 /usr/local/sbin/secureboot-refresh-grub
 
+POST="xbps-post:$ID"
+
 snapper -c root create \
-    --description "XBPS post-update" \
+    --description "$POST" \
     --cleanup-algorithm number
+
+snapper -c var create \
+    --description "$POST" \
+    --cleanup-algorithm number
+
+echo "Update complete with paired / and /var pre/post snapshots."
 EOF
 chmod 700 "$MNT/usr/local/sbin/xbps-snapshot-update"
 
-chroot "$MNT" snapper -c root create \
-    --description "Fresh secure Void base installation" \
-    --cleanup-algorithm number
+cat > "$MNT/root/SNAPSHOTS-AND-ROLLBACK.txt" <<'EOF'
+VOID BTRFS SNAPSHOT MODEL
+=========================
+
+Subvolumes:
+  @               /
+  @home           /home
+  @var            /var
+  @snapshots      /.snapshots
+  @var_snapshots  /var/.snapshots
+  @swap           /swap
+
+Why / and /var are snapshotted together:
+  Void stores the XBPS package database under /var/db/xbps.
+  A system/package rollback must therefore restore the matching root AND /var
+  snapshots from the same pair.
+
+Commands:
+  sudo snapper -c root list
+  sudo snapper -c var list
+  sudo system-snapshot "before change"
+  sudo xbps-snapshot-update
+
+Home is intentionally independent and should be backed up separately.
+@swap must never be snapshotted.
+EOF
+chmod 600 "$MNT/root/SNAPSHOTS-AND-ROLLBACK.txt"
+
+cat > "$PUBDIR/README.txt" <<'EOF'
+CUSTOM SECURE BOOT
+==================
+
+These files are PUBLIC enrollment material.
+Private keys remain inside LUKS at /root/secureboot-keys.
+
+Recommended order:
+  1. First boot with Secure Boot disabled.
+  2. Verify LUKS boot, network, keyboard, snapshots and swap.
+  3. Back up /root/secureboot-keys to encrypted offline media.
+  4. Enter ThinkPad Setup (F1).
+  5. Set a Supervisor Password.
+  6. Enter Secure Boot Custom/Setup Mode and clear current keys as appropriate.
+  7. Enroll your PK, KEK and db.
+  8. Enable Secure Boot.
+  9. Disable USB/external boot when not needed.
+ 10. Protect boot-order changes with the Supervisor Password.
+EOF
+
+log "Creating initial paired installation snapshots"
+chroot "$MNT" /usr/local/sbin/system-snapshot "fresh-secure-void-install"
 
 log "Final package configuration"
 chroot "$MNT" xbps-reconfigure -fa
 
-# xbps-reconfigure may regenerate kernel/initramfs; refresh grub.cfg and signed EFI.
+# xbps-reconfigure can regenerate kernel/initramfs/grub.cfg.
 chroot "$MNT" /usr/local/sbin/secureboot-refresh-grub
+
+log "Verifying required installation invariants"
+test -f "$MNT/boot/efi/EFI/Void/grubx64.efi" ||
+    die "Signed GRUB EFI missing."
+
+test -f "$MNT/etc/snapper/configs/root" ||
+    die "Root Snapper config missing."
+
+test -f "$MNT/etc/snapper/configs/var" ||
+    die "/var Snapper config missing."
+
+test -f "$MNT/swap/swapfile" ||
+    die "Swapfile missing."
+
+grep -q 'subvol=@snapshots' "$MNT/etc/fstab" ||
+    die "@snapshots missing from fstab."
+
+grep -q 'subvol=@var_snapshots' "$MNT/etc/fstab" ||
+    die "@var_snapshots missing from fstab."
+
+grep -q 'subvol=@home' "$MNT/etc/fstab" ||
+    die "@home missing from fstab."
+
+grep -q 'subvol=@var' "$MNT/etc/fstab" ||
+    die "@var missing from fstab."
+
+grep -q 'subvol=@swap' "$MNT/etc/fstab" ||
+    die "@swap missing from fstab."
+
+grep -q 'resume_offset=' "$MNT/etc/default/grub" ||
+    die "resume_offset missing from GRUB kernel command line."
+
+sbverify \
+    --cert "$KEYDIR/db.crt" \
+    "$MNT/boot/efi/EFI/Void/grubx64.efi" >/dev/null ||
+    die "Secure Boot signature verification failed."
 
 printf '\n'
 printf '====================================================================\n'
-printf 'Secure Void installation complete\n'
+printf ' INSTALLATION COMPLETE\n'
 printf '====================================================================\n\n'
-printf 'Disk:       %s\n' "$DISK"
-printf 'Hostname:   %s\n' "$HOSTNAME"
-printf 'User:       %s\n' "$USERNAME"
-printf 'Encryption: LUKS1\n'
-printf 'Filesystem: Btrfs (@, @home, @var)\n'
-printf '/boot:      INSIDE LUKS1\n'
-printf 'ESP:        only signed bootloader + public enrollment files\n'
-printf 'Network:    NetworkManager (Ethernet + Wi-Fi)\n'
-printf 'Keyboard:   PT-BR ThinkPad /? mapping\n\n'
+printf 'Disk:            %s\n' "$DISK"
+printf 'Hostname:        %s\n' "$HOSTNAME"
+printf 'User:            %s\n' "$USERNAME"
+printf 'LUKS:            LUKS1\n'
+printf '/boot:           encrypted inside @\n'
+printf 'Filesystem:      Btrfs\n'
+printf 'Root snapshots:  @snapshots\n'
+printf 'Var snapshots:   @var_snapshots\n'
+printf 'Home:            @home\n'
+printf 'Var:             @var\n'
+printf 'Swap:            @swap, %s GiB\n' "$SWAP_GB"
+printf 'resume_offset:   %s\n' "$RESUME_OFFSET"
+printf 'Network:         NetworkManager\n'
+printf 'Keyboard TTY:    br-abnt2 + ThinkPad /? override\n'
+printf 'Future XKB:      br(thinkpad)\n'
+printf 'Editor/VCS:      vim + git\n\n'
 
-printf 'DO NOT ENABLE SECURE BOOT YET.\n\n'
-printf 'First boot once with Secure Boot disabled and verify the system works.\n'
-printf 'Then back up /root/secureboot-keys to encrypted offline media.\n\n'
+printf 'FIRST BOOT:\n'
+printf '  Keep Secure Boot DISABLED.\n'
+printf '  Wi-Fi:              nmtui\n'
+printf '  Network:            nmcli device\n'
+printf '  Root snapshots:     sudo snapper -c root list\n'
+printf '  Var snapshots:      sudo snapper -c var list\n'
+printf '  Manual pair:        sudo system-snapshot "description"\n'
+printf '  Safe update:        sudo xbps-snapshot-update\n'
+printf '  Swap:               swapon --show\n\n'
 
-printf 'ThinkPad UEFI hardening steps (manual):\n'
-printf '  1. F1 -> Security -> Password -> set Supervisor Password.\n'
-printf '  2. Security -> Secure Boot -> Reset to Setup Mode / clear existing keys.\n'
-printf '  3. Enroll YOUR PK, KEK and db from EFI/keys on the ESP.\n'
-printf '  4. Enable Secure Boot in Custom Mode.\n'
-printf '  5. Disable USB/external boot when not needed.\n'
-printf '  6. Keep the Supervisor Password and Secure Boot private keys safe.\n\n'
+printf 'AFTER VALIDATION:\n'
+printf '  Back up /root/secureboot-keys to encrypted offline media,\n'
+printf '  then configure UEFI Supervisor Password and enroll PK/KEK/db.\n\n'
 
-printf 'Useful commands after boot:\n'
-printf '  nmcli device\n'
-printf '  nmtui\n'
-printf '  sudo snapper list\n'
-printf '  sudo snapper create --description "before change"\n'
-printf '  sudo xbps-snapshot-update\n'
-printf '  sudo secureboot-refresh-grub\n\n'
-
-printf 'Before rebooting:\n'
+printf 'Before rebooting from the live ISO:\n'
+printf '  sync\n'
 printf '  umount -R %s\n' "$MNT"
 printf '  cryptsetup close cryptroot\n'
 printf '  reboot\n'
