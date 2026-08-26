@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 # Secure Void Linux base installer
-# Target: Lenovo ThinkPad P1 Gen 2 / x86_64 glibc / UEFI
+# Target: Lenovo ThinkPad P15 Gen 1 / x86_64 glibc / UEFI
 #
 # REQUIREMENTS IMPLEMENTED
 # ------------------------
@@ -60,7 +60,7 @@ set -Eeuo pipefail
 #   HOSTNAME=host \
 #   TIMEZONE=America/Bahia \
 #   SWAP_GB=32 \
-#   ./install-void-secure-btrfs.sh
+#   ./install-void-secure-btrfs-final.sh
 #
 # SWAP_GB defaults to installed RAM rounded up to the next GiB.
 
@@ -207,7 +207,6 @@ mkdir -p \
     "$MNT/home" \
     "$MNT/var" \
     "$MNT/.snapshots" \
-    "$MNT/var/.snapshots" \
     "$MNT/swap" \
     "$MNT/boot/efi"
 
@@ -217,6 +216,8 @@ mount -o "${BTRFS_OPTS},subvol=@home" \
 mount -o "${BTRFS_OPTS},subvol=@var" \
     /dev/mapper/cryptroot "$MNT/var"
 
+# @var hides the pre-existing /var directory, so create the nested mountpoint
+# only after @var is mounted.
 mkdir -p "$MNT/var/.snapshots"
 
 mount -o "${BTRFS_OPTS},subvol=@snapshots" \
@@ -373,8 +374,6 @@ ln -sfn /etc/sv/NetworkManager \
 ln -sfn /etc/sv/cronie \
     "$MNT/var/service/cronie"
 
-ln -sfn /etc/sv/snapperd \
-    "$MNT/var/service/snapperd"
 
 log "Creating administrative user: $USERNAME"
 if ! chroot "$MNT" id "$USERNAME" >/dev/null 2>&1; then
@@ -477,16 +476,16 @@ case "${1:-}" in
         ID="$(date -u +%Y%m%dT%H%M%SZ)"
         DESC="paired-timeline:$ID"
 
-        snapper -c root create \
+        snapper --no-dbus -c root create \
             --description "$DESC" \
             --cleanup-algorithm timeline
 
-        snapper -c var create \
+        snapper --no-dbus -c var create \
             --description "$DESC" \
             --cleanup-algorithm timeline
 
-        snapper -c root cleanup timeline
-        snapper -c var cleanup timeline
+        snapper --no-dbus -c root cleanup timeline
+        snapper --no-dbus -c var cleanup timeline
         ;;
 
     "")
@@ -498,11 +497,11 @@ case "${1:-}" in
         ID="$(date -u +%Y%m%dT%H%M%SZ)"
         DESC="paired:$ID:$*"
 
-        snapper -c root create \
+        snapper --no-dbus -c root create \
             --description "$DESC" \
             --cleanup-algorithm number
 
-        snapper -c var create \
+        snapper --no-dbus -c var create \
             --description "$DESC" \
             --cleanup-algorithm number
         ;;
@@ -546,6 +545,17 @@ fi
 
 chroot "$MNT" dracut --regenerate-all --force
 mkdir -p "$MNT/boot/grub"
+
+# Install the normal GRUB module tree under encrypted /boot/grub first.  The
+# signed standalone EFI below is the bootstrap, while external modules remain
+# available after LUKS has been unlocked.
+chroot "$MNT" grub-install \
+    --target=x86_64-efi \
+    --efi-directory=/boot/efi \
+    --boot-directory=/boot \
+    --bootloader-id=Void \
+    --no-nvram
+
 chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
 
 log "Generating custom Secure Boot PK, KEK and db keys"
@@ -633,9 +643,12 @@ insmod btrfs
 
 cryptomount -a
 
-search --fs-uuid --set=root $BTRFS_UUID
-set prefix=(\$root)/@/boot/grub
-configfile (\$root)/@/boot/grub/grub.cfg
+# This installer creates exactly one encrypted system volume.  On the tested
+# machine GRUB exposes it as crypto0 after cryptomount succeeds.
+set root=(crypto0)
+set prefix=(crypto0)/@/boot/grub
+insmod normal
+normal
 EOF
 
 mkdir -p \
@@ -645,7 +658,7 @@ mkdir -p \
 chroot "$MNT" grub-mkstandalone \
     -O x86_64-efi \
     -o /root/grub-build/grubx64-unsigned.efi \
-    --modules="part_gpt cryptodisk luks gcry_rijndael gcry_sha1 gcry_sha256 gcry_sha512 btrfs normal configfile search search_fs_uuid linux all_video gfxterm echo reboot halt" \
+    --modules="part_gpt cryptodisk luks gcry_rijndael gcry_sha1 gcry_sha256 gcry_sha512 btrfs normal configfile search search_fs_uuid linux ls cat all_video gfxterm echo reboot halt" \
     "boot/grub/grub.cfg=/root/grub-build/early.cfg"
 
 sbsign \
@@ -691,16 +704,24 @@ BUILD=/root/grub-build
     exit 1
 }
 
-BTRFS_UUID="$(findmnt -no UUID /)"
-
 mkdir -p \
     "$BUILD" \
     "$ESP/EFI/Void" \
     "$ESP/EFI/BOOT"
 
+# Refresh /boot/grub/x86_64-efi as well as grub.cfg.  grub-install may write an
+# unsigned EFI loader temporarily; the signed standalone image generated below
+# overwrites it before this helper returns.
+grub-install \
+    --target=x86_64-efi \
+    --efi-directory="$ESP" \
+    --boot-directory=/boot \
+    --bootloader-id=Void \
+    --no-nvram
+
 grub-mkconfig -o /boot/grub/grub.cfg
 
-cat > "$BUILD/early.cfg" <<EOC
+cat > "$BUILD/early.cfg" <<'EOC'
 set pager=1
 insmod part_gpt
 insmod cryptodisk
@@ -713,15 +734,16 @@ insmod btrfs
 
 cryptomount -a
 
-search --fs-uuid --set=root $BTRFS_UUID
-set prefix=(\$root)/@/boot/grub
-configfile (\$root)/@/boot/grub/grub.cfg
+set root=(crypto0)
+set prefix=(crypto0)/@/boot/grub
+insmod normal
+normal
 EOC
 
 grub-mkstandalone \
     -O x86_64-efi \
     -o "$BUILD/grubx64-unsigned.efi" \
-    --modules="part_gpt cryptodisk luks gcry_rijndael gcry_sha1 gcry_sha256 gcry_sha512 btrfs normal configfile search search_fs_uuid linux all_video gfxterm echo reboot halt" \
+    --modules="part_gpt cryptodisk luks gcry_rijndael gcry_sha1 gcry_sha256 gcry_sha512 btrfs normal configfile search search_fs_uuid linux ls cat all_video gfxterm echo reboot halt" \
     "boot/grub/grub.cfg=$BUILD/early.cfg"
 
 sbsign \
@@ -749,11 +771,11 @@ set -eu
 ID="$(date -u +%Y%m%dT%H%M%SZ)"
 PRE="xbps-pre:$ID"
 
-snapper -c root create \
+snapper --no-dbus -c root create \
     --description "$PRE" \
     --cleanup-algorithm number
 
-snapper -c var create \
+snapper --no-dbus -c var create \
     --description "$PRE" \
     --cleanup-algorithm number
 
@@ -766,11 +788,11 @@ fi
 
 POST="xbps-post:$ID"
 
-snapper -c root create \
+snapper --no-dbus -c root create \
     --description "$POST" \
     --cleanup-algorithm number
 
-snapper -c var create \
+snapper --no-dbus -c var create \
     --description "$POST" \
     --cleanup-algorithm number
 
@@ -796,8 +818,8 @@ Why / and /var are snapshotted together:
   snapshots from the same pair.
 
 Commands:
-  sudo snapper -c root list
-  sudo snapper -c var list
+  sudo snapper --no-dbus -c root list
+  sudo snapper --no-dbus -c var list
   sudo system-snapshot "before change"
   sudo xbps-snapshot-update
 
@@ -827,7 +849,7 @@ Recommended order:
 EOF
 
 log "Creating initial paired installation snapshots"
-chroot "$MNT" /usr/local/sbin/system-snapshot "fresh-secure-void-install"
+chroot "$MNT" /usr/bin/env LANG=C LC_ALL=C /usr/local/sbin/system-snapshot "fresh-secure-void-install"
 
 log "Final package configuration"
 chroot "$MNT" xbps-reconfigure -fa
@@ -896,8 +918,8 @@ printf 'FIRST BOOT:\n'
 printf '  Keep Secure Boot DISABLED.\n'
 printf '  Wi-Fi:              nmtui\n'
 printf '  Network:            nmcli device\n'
-printf '  Root snapshots:     sudo snapper -c root list\n'
-printf '  Var snapshots:      sudo snapper -c var list\n'
+printf '  Root snapshots:     sudo snapper --no-dbus -c root list\n'
+printf '  Var snapshots:      sudo snapper --no-dbus -c var list\n'
 printf '  Manual pair:        sudo system-snapshot "description"\n'
 printf '  Safe update:        sudo xbps-snapshot-update\n'
 printf '  Swap:               swapon --show\n\n'

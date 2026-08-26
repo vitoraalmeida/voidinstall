@@ -7,7 +7,7 @@ set -Eeuo pipefail
 #
 # Target:
 #   Void Linux x86_64 glibc + runit
-#   Lenovo ThinkPad P1 Gen 2
+#   Lenovo ThinkPad P15 Gen 1
 #   Intel iGPU + NVIDIA Quadro T1000 4 GB
 #
 # Installs/configures:
@@ -125,6 +125,9 @@ xbps-install -S
 # ---------------------------------------------------------------------------
 
 install_required \
+    dbus \
+    NetworkManager \
+    python3 \
     niri \
     xwayland-satellite \
     elogind \
@@ -230,7 +233,8 @@ install_required \
     mesa-dri \
     mesa-vulkan-intel \
     vulkan-loader \
-    intel-video-accel
+    intel-video-accel \
+    glxinfo
 
 # ---------------------------------------------------------------------------
 # Secure-Boot-aware NVIDIA DKMS + PRIME
@@ -270,10 +274,12 @@ cat > /etc/modprobe.d/90-nvidia-thinkpad.conf <<'EOF'
 # Modern Wayland/Niri.
 options nvidia_drm modeset=1 fbdev=1
 
-# Turing dynamic runtime D3 power management.
+# Request Turing dynamic runtime D3 power management.  Some P15 Gen 1 firmware
+# configurations report RTD3 as unsupported; PRIME offload still works normally.
 options nvidia NVreg_DynamicPowerManagement=0x02
 EOF
 
+mkdir -p /etc/udev/rules.d
 cat > /etc/udev/rules.d/80-nvidia-runtime-pm.rules <<'EOF'
 ACTION=="add",  SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", TEST=="power/control", ATTR{power/control}="auto"
 ACTION=="bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", TEST=="power/control", ATTR{power/control}="auto"
@@ -334,7 +340,6 @@ enable_service dbus
 enable_service NetworkManager
 enable_service elogind
 enable_service bluetoothd
-enable_service upower
 enable_service tlp
 enable_service tlp-pd
 
@@ -539,6 +544,9 @@ replace_once(
     'Super+Alt+L hotkey-overlay-title="Lock: Noctalia" { spawn "noctalia" "msg" "session" "lock"; }'
 )
 
+# Multimedia-line formatting changes between Niri releases.  These replacements
+# are cosmetic integrations with Noctalia; the stock wpctl/brightnessctl binds
+# are still functional if a future default cannot be matched exactly.
 for old, new in {
     'XF86AudioRaiseVolume allow-when-locked=true { spawn-sh "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.1+ -l 1.0"; }':
         'XF86AudioRaiseVolume allow-when-locked=true { spawn "noctalia" "msg" "volume-up"; }',
@@ -551,7 +559,7 @@ for old, new in {
     'XF86MonBrightnessDown allow-when-locked=true { spawn "brightnessctl" "--class=backlight" "set" "10%-"; }':
         'XF86MonBrightnessDown allow-when-locked=true { spawn "noctalia" "msg" "brightness-down"; }',
 }.items():
-    replace_once(old, new)
+    replace_once(old, new, required=False)
 
 # Add bindings inside the ONE existing binds {} block.
 extra_binds = """binds {
@@ -708,7 +716,7 @@ printf '  loginctl hibernate\n\n'
 
 printf 'Notes:\n'
 printf '  - The internal desktop renderer is Intel when detection succeeded.\n'
-printf '  - HDMI on this P1 may keep the T1000 awake because the port is dGPU-wired.\n'
+printf '  - HDMI on this P15 may keep the T1000 awake because the port is dGPU-wired.\n'
 printf '  - If an external high-refresh display has cross-GPU presentation issues,\n'
 printf '    remove render-drm-device from ~/.config/niri/config.kdl and let Niri\n'
 printf '    select the renderer automatically.\n'
