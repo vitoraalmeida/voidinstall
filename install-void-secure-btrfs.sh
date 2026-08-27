@@ -60,9 +60,23 @@ set -Eeuo pipefail
 #   HOSTNAME=host \
 #   TIMEZONE=America/Bahia \
 #   SWAP_GB=32 \
-#   ./install-void-secure-btrfs-final.sh
+#   ./install-void-secure-btrfs.sh
 #
 # SWAP_GB defaults to installed RAM rounded up to the next GiB.
+#
+# Fully non-interactive run (DANGEROUS: erases the disk without asking).
+# All four variables are required together:
+#
+#   ASSUME_ERASE=yes \
+#   LUKS_PASSPHRASE='...' \
+#   ROOT_PASSWORD='...' \
+#   USER_PASSWORD='...' \
+#   DISK=/dev/nvme0n1 \
+#   ./install-void-secure-btrfs.sh
+#
+# In this mode the LUKS passphrase is staged in a root-only tmpfs file and
+# shredded on exit; passwords are applied through chpasswd stdin and unset.
+# Prefer invoking from a wrapper so the values stay out of shell history.
 
 DISK="${DISK:-/dev/nvme0n1}"
 USERNAME="${USERNAME:-user}"
@@ -71,6 +85,12 @@ TIMEZONE="${TIMEZONE:-America/Bahia}"
 REPO="${REPO:-https://repo-default.voidlinux.org/current}"
 MNT="${MNT:-/mnt}"
 SWAP_GB="${SWAP_GB:-}"
+ASSUME_ERASE="${ASSUME_ERASE:-}"
+LUKS_PASSPHRASE="${LUKS_PASSPHRASE:-}"
+ROOT_PASSWORD="${ROOT_PASSWORD:-}"
+USER_PASSWORD="${USER_PASSWORD:-}"
+LUKS_PASS_FILE="/run/pneuma-luks-pass"
+NONINTERACTIVE=no
 
 log()  { printf '\n==> %s\n' "$*"; }
 warn() { printf '\nWARNING: %s\n' "$*" >&2; }
@@ -81,6 +101,9 @@ require_cmd() {
 }
 
 cleanup() {
+    if [[ -f "$LUKS_PASS_FILE" ]]; then
+        shred -u "$LUKS_PASS_FILE" 2>/dev/null || rm -f "$LUKS_PASS_FILE"
+    fi
     sync || true
 }
 trap cleanup EXIT
@@ -90,9 +113,81 @@ trap cleanup EXIT
 [[ -d /sys/firmware/efi ]] || die "Boot the live ISO in UEFI mode."
 [[ -b "$DISK" ]] || die "Target disk does not exist: $DISK"
 
+# xbps-install must already exist in the official Void live environment.
+require_cmd xbps-install
+
+install_live_dependencies() {
+    declare -A command_packages=(
+        [parted]="parted"
+        [partprobe]="parted"
+
+        [cryptsetup]="cryptsetup"
+
+        [mkfs.vfat]="dosfstools"
+
+        [mkfs.btrfs]="btrfs-progs"
+        [btrfs]="btrfs-progs"
+
+        [wipefs]="util-linux"
+        [blkid]="util-linux"
+        [mount]="util-linux"
+        [umount]="util-linux"
+        [lsblk]="util-linux"
+        [swapoff]="util-linux"
+
+        [udevadm]="eudev"
+
+        [openssl]="openssl"
+
+        [cert-to-efi-sig-list]="efitools"
+        [sign-efi-sig-list]="efitools"
+
+        [sbsign]="sbsigntool"
+        [sbverify]="sbsigntool"
+    )
+
+    declare -A missing_packages=()
+
+    for cmd in "${!command_packages[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            missing_packages["${command_packages[$cmd]}"]=1
+        fi
+    done
+
+    if ((${#missing_packages[@]} > 0)); then
+        log "Refreshing live repository metadata"
+        xbps-install -S
+
+        log "Installing missing live-environment packages"
+        xbps-install -y "${!missing_packages[@]}"
+    fi
+}
+
+install_live_dependencies
+
+# Verify everything required by the installer is now available.
 for cmd in \
-    xbps-install cryptsetup parted wipefs mkfs.vfat mkfs.btrfs \
-    btrfs blkid mount umount chroot udevadm partprobe lsblk; do
+    xbps-install \
+    cryptsetup \
+    parted \
+    wipefs \
+    mkfs.vfat \
+    mkfs.btrfs \
+    btrfs \
+    blkid \
+    mount \
+    umount \
+    chroot \
+    udevadm \
+    partprobe \
+    lsblk \
+    swapoff \
+    openssl \
+    cert-to-efi-sig-list \
+    sign-efi-sig-list \
+    sbsign \
+    sbverify
+do
     require_cmd "$cmd"
 done
 
@@ -112,6 +207,25 @@ fi
 [[ "$SWAP_GB" =~ ^[0-9]+$ ]] || die "SWAP_GB must be an integer."
 (( SWAP_GB >= 2 )) || die "SWAP_GB must be at least 2 GiB."
 
+if [[ -n "$ASSUME_ERASE" ]]; then
+    [[ "$ASSUME_ERASE" == "yes" ]] || die "ASSUME_ERASE must be 'yes' when set."
+    [[ -n "$LUKS_PASSPHRASE" ]] || die "ASSUME_ERASE=yes requires LUKS_PASSPHRASE."
+    [[ -n "$ROOT_PASSWORD" ]] || die "ASSUME_ERASE=yes requires ROOT_PASSWORD."
+    [[ -n "$USER_PASSWORD" ]] || die "ASSUME_ERASE=yes requires USER_PASSWORD."
+    NONINTERACTIVE=yes
+else
+    [[ -z "$LUKS_PASSPHRASE" && -z "$ROOT_PASSWORD" && -z "$USER_PASSWORD" ]] ||
+        die "LUKS_PASSPHRASE/ROOT_PASSWORD/USER_PASSWORD require ASSUME_ERASE=yes."
+fi
+
+# Stage the LUKS passphrase in a root-only tmpfs file and drop the env copy
+# immediately. No trailing newline: cryptsetup --key-file uses the whole file
+# content as the key, and it must match later interactive typing.
+if [[ "$NONINTERACTIVE" == "yes" ]]; then
+    ( umask 077; printf '%s' "$LUKS_PASSPHRASE" > "$LUKS_PASS_FILE" )
+    unset LUKS_PASSPHRASE
+fi
+
 if [[ "$DISK" =~ (nvme|mmcblk) ]]; then
     ESP="${DISK}p1"
     CRYPT="${DISK}p2"
@@ -119,9 +233,6 @@ else
     ESP="${DISK}1"
     CRYPT="${DISK}2"
 fi
-
-log "Refreshing live repository metadata"
-xbps-install -S
 
 printf '\n'
 printf '============================================================\n'
@@ -145,10 +256,14 @@ printf '    @swap           -> /swap\n\n'
 lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS "$DISK" || true
 
 printf '\nTHIS WILL ERASE ALL DATA ON %s.\n' "$DISK"
-printf 'Type exactly: ERASE %s\n> ' "$DISK"
-read -r confirmation
-[[ "$confirmation" == "ERASE $DISK" ]] ||
-    die "Confirmation did not match. No destructive action was performed."
+if [[ "$NONINTERACTIVE" == "yes" ]]; then
+    printf 'ASSUME_ERASE=yes: skipping interactive confirmation.\n'
+else
+    printf 'Type exactly: ERASE %s\n> ' "$DISK"
+    read -r confirmation
+    [[ "$confirmation" == "ERASE $DISK" ]] ||
+        die "Confirmation did not match. No destructive action was performed."
+fi
 
 log "Cleaning previous mounts/mappings"
 swapoff -a 2>/dev/null || true
@@ -173,9 +288,15 @@ log "Formatting EFI System Partition"
 mkfs.vfat -F32 -n EFI "$ESP"
 
 log "Creating LUKS1 container"
-printf '\nChoose a strong disk-encryption passphrase.\n'
-cryptsetup luksFormat --type luks1 "$CRYPT"
-cryptsetup open "$CRYPT" cryptroot
+if [[ "$NONINTERACTIVE" == "yes" ]]; then
+    cryptsetup luksFormat --type luks1 --batch-mode \
+        --key-file "$LUKS_PASS_FILE" "$CRYPT"
+    cryptsetup open --key-file "$LUKS_PASS_FILE" "$CRYPT" cryptroot
+else
+    printf '\nChoose a strong disk-encryption passphrase.\n'
+    cryptsetup luksFormat --type luks1 "$CRYPT"
+    cryptsetup open "$CRYPT" cryptroot
+fi
 
 log "Creating Btrfs filesystem"
 mkfs.btrfs -f -L voidroot /dev/mapper/cryptroot
@@ -246,7 +367,7 @@ log "Bootstrapping Void Linux"
 mkdir -p "$MNT/var/db/xbps/keys"
 cp /var/db/xbps/keys/* "$MNT/var/db/xbps/keys/"
 
-XBPS_ARCH=x86_64 xbps-install -Sy \
+XBPS_ARCH=x86_64 xbps-install -Sy -y \
     -r "$MNT" \
     -R "$REPO" \
     base-system \
@@ -254,7 +375,6 @@ XBPS_ARCH=x86_64 xbps-install -Sy \
     grub-x86_64-efi \
     efibootmgr \
     efitools \
-    efitools-efi \
     sbsigntool \
     openssl \
     NetworkManager \
@@ -305,11 +425,12 @@ dd if=/dev/urandom \
     bs=64 count=1 status=none
 chmod 000 "$MNT/boot/volume.key"
 
-cryptsetup luksAddKey "$CRYPT" "$MNT/boot/volume.key"
-
-cat > "$MNT/etc/crypttab" <<EOF
-cryptroot UUID=$LUKS_UUID /boot/volume.key luks
-EOF
+if [[ "$NONINTERACTIVE" == "yes" ]]; then
+    cryptsetup luksAddKey --key-file "$LUKS_PASS_FILE" \
+        "$CRYPT" "$MNT/boot/volume.key"
+else
+    cryptsetup luksAddKey "$CRYPT" "$MNT/boot/volume.key"
+fi
 
 log "Configuring hostname, locale and timezone"
 printf '%s\n' "$HOSTNAME" > "$MNT/etc/hostname"
@@ -390,11 +511,17 @@ cat > "$MNT/etc/sudoers.d/10-wheel" <<'EOF'
 EOF
 chmod 440 "$MNT/etc/sudoers.d/10-wheel"
 
-printf '\nSet ROOT password:\n'
-chroot "$MNT" passwd root
+if [[ "$NONINTERACTIVE" == "yes" ]]; then
+    printf 'root:%s\n' "$ROOT_PASSWORD" | chroot "$MNT" chpasswd
+    printf '%s:%s\n' "$USERNAME" "$USER_PASSWORD" | chroot "$MNT" chpasswd
+    unset ROOT_PASSWORD USER_PASSWORD
+else
+    printf '\nSet ROOT password:\n'
+    chroot "$MNT" passwd root
 
-printf '\nSet password for %s:\n' "$USERNAME"
-chroot "$MNT" passwd "$USERNAME"
+    printf '\nSet password for %s:\n' "$USERNAME"
+    chroot "$MNT" passwd "$USERNAME"
+fi
 
 log "Configuring Snapper for explicit root and /var snapshot stores"
 mkdir -p "$MNT/etc/snapper/configs"
@@ -484,8 +611,8 @@ case "${1:-}" in
             --description "$DESC" \
             --cleanup-algorithm timeline
 
-        snapper --no-dbus -c root cleanup timeline
-        snapper --no-dbus -c var cleanup timeline
+        snapper --no-dbus -c root cleanup all
+        snapper --no-dbus -c var cleanup all
         ;;
 
     "")
@@ -520,7 +647,7 @@ log "Configuring dracut for LUKS1, Btrfs and hibernation"
 mkdir -p "$MNT/etc/dracut.conf.d"
 cat > "$MNT/etc/dracut.conf.d/10-cryptroot.conf" <<'EOF'
 add_dracutmodules+=" crypt btrfs resume "
-install_items+=" /boot/volume.key /etc/crypttab "
+install_items+=" /boot/volume.key "
 hostonly="yes"
 EOF
 
@@ -532,7 +659,7 @@ else
     printf '\nGRUB_ENABLE_CRYPTODISK=y\n' >> "$MNT/etc/default/grub"
 fi
 
-KERNEL_CMDLINE="loglevel=4 rd.luks.uuid=luks-$LUKS_UUID root=UUID=$BTRFS_UUID rootflags=subvol=@ resume=UUID=$BTRFS_UUID resume_offset=$RESUME_OFFSET rw"
+KERNEL_CMDLINE="loglevel=4 rd.luks.uuid=luks-$LUKS_UUID rd.luks.key=/boot/volume.key root=UUID=$BTRFS_UUID rootflags=subvol=@ resume=UUID=$BTRFS_UUID resume_offset=$RESUME_OFFSET rw"
 
 if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$MNT/etc/default/grub"; then
     sed -i \
@@ -643,10 +770,10 @@ insmod btrfs
 
 cryptomount -a
 
-# This installer creates exactly one encrypted system volume.  On the tested
-# machine GRUB exposes it as crypto0 after cryptomount succeeds.
-set root=(crypto0)
-set prefix=(crypto0)/@/boot/grub
+# Resolve the root by filesystem UUID so boot does not depend on the
+# GRUB-assigned crypto device number.
+search --no-floppy --fs-uuid --set=root $BTRFS_UUID
+set prefix=(\$root)/@/boot/grub
 insmod normal
 normal
 EOF
@@ -719,9 +846,18 @@ grub-install \
     --bootloader-id=Void \
     --no-nvram
 
+# Re-derive the btrfs resume_offset so hibernation keeps working if the
+# swapfile's physical location ever changes (balance/defrag).
+RESUME_OFFSET="$(btrfs inspect-internal map-swapfile -r /swap/swapfile 2>/dev/null || true)"
+if [ -n "$RESUME_OFFSET" ]; then
+    sed -i "s|resume_offset=[0-9][0-9]*|resume_offset=$RESUME_OFFSET|" /etc/default/grub
+fi
+
 grub-mkconfig -o /boot/grub/grub.cfg
 
-cat > "$BUILD/early.cfg" <<'EOC'
+BTRFS_UUID="$(blkid -s UUID -o value /dev/mapper/cryptroot)"
+
+cat > "$BUILD/early.cfg" <<EOC
 set pager=1
 insmod part_gpt
 insmod cryptodisk
@@ -734,8 +870,8 @@ insmod btrfs
 
 cryptomount -a
 
-set root=(crypto0)
-set prefix=(crypto0)/@/boot/grub
+search --no-floppy --fs-uuid --set=root $BTRFS_UUID
+set prefix=(\$root)/@/boot/grub
 insmod normal
 normal
 EOC
@@ -779,7 +915,7 @@ snapper --no-dbus -c var create \
     --description "$PRE" \
     --cleanup-algorithm number
 
-if ! xbps-install -Su; then
+if ! xbps-install -Su -y; then
     echo "XBPS update failed; pre-update snapshots were retained." >&2
     exit 1
 fi
