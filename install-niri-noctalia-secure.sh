@@ -19,6 +19,8 @@ set -Eeuo pipefail
 #   - TLP + tlp-pd + tlp-rdw
 #   - XDG portals, gnome-keyring, polkit, automount
 #   - Alacritty, Brave (Flatpak), Nautilus, MPV
+#   - adw-gtk3 from the latest upstream release
+#   - nwg-look built from the official upstream repository
 #   - GTK integration helpers and Noctalia GTK/Alacritty templates
 #   - Inconsolata Nerd Font Mono
 #   - PT-BR ThinkPad XKB: br(thinkpad)
@@ -37,10 +39,14 @@ set -Eeuo pipefail
 # Optional environment variables:
 #   INSTALL_BRAVE=1
 #   INSTALL_INCONSOLATA_NERD_FONT=1
+#   INSTALL_ADW_GTK3=1
+#   INSTALL_NWG_LOOK=1
 #   FORCE_INTEL_RENDERER=1
 
 INSTALL_BRAVE="${INSTALL_BRAVE:-1}"
 INSTALL_INCONSOLATA_NERD_FONT="${INSTALL_INCONSOLATA_NERD_FONT:-1}"
+INSTALL_ADW_GTK3="${INSTALL_ADW_GTK3:-1}"
+INSTALL_NWG_LOOK="${INSTALL_NWG_LOOK:-1}"
 FORCE_INTEL_RENDERER="${FORCE_INTEL_RENDERER:-1}"
 
 log()  { printf '\n==> %s\n' "$*"; }
@@ -256,7 +262,6 @@ install_required \
     mpv \
     imv \
     flatpak \
-    nwg-look \
     dconf \
     gsettings-desktop-schemas \
     fontconfig \
@@ -264,6 +269,93 @@ install_required \
     noto-fonts-ttf \
     noto-fonts-emoji \
     font-firacode
+
+# ---------------------------------------------------------------------------
+# Source-install dependencies for nwg-look
+# ---------------------------------------------------------------------------
+
+if [[ "$INSTALL_NWG_LOOK" == 1 ]]; then
+    install_required \
+        go \
+        gcc \
+        make \
+        pkg-config \
+        gtk+3-devel \
+        cairo-devel \
+        libglib-devel \
+        pango-devel \
+        xcur2png
+fi
+
+# ---------------------------------------------------------------------------
+# adw-gtk3 (upstream release, not XBPS)
+# ---------------------------------------------------------------------------
+
+if [[ "$INSTALL_ADW_GTK3" == 1 ]]; then
+    log "Installing adw-gtk3 from the latest upstream release"
+
+    THEMES_DIR="$USER_HOME/.local/share/themes"
+    TMP_ADW_DIR="$(mktemp -d)"
+    ADW_ARCHIVE="$TMP_ADW_DIR/adw-gtk3.tar.xz"
+
+    mkdir -p "$THEMES_DIR"
+
+    ADW_URL="$(
+        curl -fsSL https://api.github.com/repos/lassekongo83/adw-gtk3/releases/latest |
+        jq -r '.assets[] | select(.name | endswith(".tar.xz")) | .browser_download_url' |
+        head -n1
+    )"
+
+    [[ -n "$ADW_URL" && "$ADW_URL" != "null" ]] ||
+        die "Could not determine the latest adw-gtk3 tar.xz release asset."
+
+    curl -fL "$ADW_URL" -o "$ADW_ARCHIVE"
+
+    rm -rf \
+        "$THEMES_DIR/adw-gtk3" \
+        "$THEMES_DIR/adw-gtk3-dark"
+
+    tar -xJf "$ADW_ARCHIVE" -C "$THEMES_DIR"
+    rm -rf "$TMP_ADW_DIR"
+
+    chown -R "$TARGET_USER:$TARGET_USER" "$THEMES_DIR"
+
+    # Upstream recommends these theme extensions for GTK3 Flatpak apps.
+    flatpak remote-add --if-not-exists \
+        flathub \
+        https://dl.flathub.org/repo/flathub.flatpakrepo
+
+    flatpak install -y --noninteractive \
+        flathub \
+        org.gtk.Gtk3theme.adw-gtk3 \
+        org.gtk.Gtk3theme.adw-gtk3-dark ||
+        warn "Could not install adw-gtk3 Flatpak theme extensions."
+fi
+
+# ---------------------------------------------------------------------------
+# nwg-look (official upstream source, not XBPS)
+# ---------------------------------------------------------------------------
+
+if [[ "$INSTALL_NWG_LOOK" == 1 ]]; then
+    log "Building and installing nwg-look from upstream"
+
+    TMP_NWG_DIR="$(mktemp -d)"
+
+    git clone --depth 1 \
+        https://github.com/nwg-piotr/nwg-look.git \
+        "$TMP_NWG_DIR/nwg-look"
+
+    (
+        cd "$TMP_NWG_DIR/nwg-look"
+        make build
+        make install
+    )
+
+    rm -rf "$TMP_NWG_DIR"
+
+    command -v nwg-look >/dev/null 2>&1 ||
+        die "nwg-look installation finished but the executable was not found."
+fi
 
 # ---------------------------------------------------------------------------
 # System services
@@ -370,6 +462,24 @@ export XDG_DATA_DIRS="$HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/
 
 append_once "$USER_HOME/.profile" "$PROFILE_MARKER" "$PROFILE_CONTENT"
 chown "$TARGET_USER:$TARGET_USER" "$USER_HOME/.profile"
+
+# ---------------------------------------------------------------------------
+# GTK theme defaults
+# ---------------------------------------------------------------------------
+
+if [[ "$INSTALL_ADW_GTK3" == 1 ]]; then
+    log "Setting adw-gtk3-dark as the GTK theme"
+
+    runuser -u "$TARGET_USER" -- \
+        env HOME="$USER_HOME" \
+        dbus-run-session -- \
+        gsettings set org.gnome.desktop.interface gtk-theme 'adw-gtk3-dark' || true
+
+    runuser -u "$TARGET_USER" -- \
+        env HOME="$USER_HOME" \
+        dbus-run-session -- \
+        gsettings set org.gnome.desktop.interface color-scheme 'prefer-dark' || true
+fi
 
 # ---------------------------------------------------------------------------
 # Noctalia configuration
@@ -795,6 +905,6 @@ printf 'Notes:\n'
 printf '  - No NVIDIA, Steam or virtualization packages were installed.\n'
 printf '  - No display manager was installed.\n'
 printf '  - Noctalia handles launcher, notifications, lock screen and idle policy.\n'
+printf '  - adw-gtk3 is installed from the latest upstream release.\n'
+printf '  - nwg-look is built from its official upstream repository.\n'
 printf '  - GTK3/GTK4 and Alacritty Noctalia templates are enabled.\n'
-printf '  - If GTK theming needs adw-gtk3, install that theme separately;\n'
-printf '    it is not currently an official Void package.\n'
