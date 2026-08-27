@@ -382,6 +382,7 @@ XBPS_ARCH=x86_64 xbps-install -Sy -y \
     snapper \
     cronie \
     xkeyboard-config \
+    linux-firmware \
     vim \
     git \
     rsync
@@ -444,12 +445,12 @@ log "Configuring hostname, locale and timezone"
 printf '%s\n' "$HOSTNAME" > "$MNT/etc/hostname"
 
 cat > "$MNT/etc/locale.conf" <<'EOF'
-LANG=pt_BR.UTF-8
+LANG=en_US.UTF-8
 LC_COLLATE=C
 EOF
 
-if ! grep -q '^pt_BR.UTF-8 UTF-8' "$MNT/etc/default/libc-locales"; then
-    printf '\npt_BR.UTF-8 UTF-8\n' >> "$MNT/etc/default/libc-locales"
+if ! grep -q '^en_US.UTF-8 UTF-8' "$MNT/etc/default/libc-locales"; then
+    printf '\nen_US.UTF-8 UTF-8\n' >> "$MNT/etc/default/libc-locales"
 fi
 
 ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$MNT/etc/localtime"
@@ -1038,6 +1039,30 @@ test -f "$MNT/etc/snapper/configs/var" ||
 test -f "$MNT/swap/swapfile" ||
     die "Swapfile missing."
 
+# Network invariants: NetworkManager is the sole DHCP/DNS manager, so a
+# missing package or activation symlink must abort the install instead of
+# producing a system that boots without any working network manager.
+test -d "$MNT/etc/sv/NetworkManager" ||
+    die "NetworkManager package service missing from /etc/sv."
+
+test -x "$MNT/etc/sv/NetworkManager/run" ||
+    die "NetworkManager service run script missing."
+
+chroot "$MNT" sh -c 'test -e /var/service/NetworkManager' ||
+    die "NetworkManager service not activated in /var/service."
+
+test -x "$MNT/etc/sv/dbus/run" ||
+    die "dbus package service missing from /etc/sv."
+
+chroot "$MNT" sh -c 'test -e /var/service/dbus' ||
+    die "dbus service not activated in /var/service."
+
+test -e "$MNT/var/service/dhcpcd" &&
+    die "dhcpcd service is activated; it would conflict with NetworkManager."
+
+test -e "$MNT/var/service/wpa_supplicant" &&
+    die "wpa_supplicant service is activated; NetworkManager manages it via dbus."
+
 grep -q 'subvol=@snapshots' "$MNT/etc/fstab" ||
     die "@snapshots missing from fstab."
 
@@ -1084,6 +1109,7 @@ printf 'Editor/VCS:      vim + git\n\n'
 
 printf 'FIRST BOOT:\n'
 printf '  Keep Secure Boot DISABLED.\n'
+printf '  Services:           sv status dbus NetworkManager\n'
 printf '  Wi-Fi:              nmtui\n'
 printf '  Network:            nmcli device\n'
 printf '  Root snapshots:     sudo snapper --no-dbus -c root list\n'
