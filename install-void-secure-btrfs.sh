@@ -520,8 +520,31 @@ EOF
 chmod 440 "$MNT/etc/sudoers.d/10-wheel"
 
 if [[ "$NONINTERACTIVE" == "yes" ]]; then
-    printf 'root:%s\n' "$ROOT_PASSWORD" | chroot "$MNT" chpasswd
-    printf '%s:%s\n' "$USERNAME" "$USER_PASSWORD" | chroot "$MNT" chpasswd
+    log "Setting root and user passwords"
+
+    printf 'root:%s\n' "$ROOT_PASSWORD" |
+        chroot "$MNT" chpasswd -c SHA512
+
+    printf '%s:%s\n' "$USERNAME" "$USER_PASSWORD" |
+        chroot "$MNT" chpasswd -c SHA512
+
+    ROOT_HASH="$(
+        awk -F: '$1 == "root" { print $2 }' "$MNT/etc/shadow"
+    )"
+
+    USER_HASH="$(
+        awk -F: -v user="$USERNAME" \
+            '$1 == user { print $2 }' \
+            "$MNT/etc/shadow"
+    )"
+
+    [[ "$ROOT_HASH" == \$6\$* ]] ||
+        die "Root password was not written correctly to /etc/shadow."
+
+    [[ "$USER_HASH" == \$6\$* ]] ||
+        die "Password for $USERNAME was not written correctly to /etc/shadow."
+
+    unset ROOT_HASH USER_HASH
     unset ROOT_PASSWORD USER_PASSWORD
 else
     printf '\nSet ROOT password:\n'
@@ -530,6 +553,7 @@ else
     printf '\nSet password for %s:\n' "$USERNAME"
     chroot "$MNT" passwd "$USERNAME"
 fi
+
 
 log "Configuring Snapper for explicit root and /var snapshot stores"
 mkdir -p "$MNT/etc/snapper/configs"

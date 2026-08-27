@@ -302,8 +302,7 @@ if [[ "$INSTALL_ADW_GTK3" == 1 ]]; then
 
     ADW_URL="$(
         curl -fsSL https://api.github.com/repos/lassekongo83/adw-gtk3/releases/latest |
-        jq -r '.assets[] | select(.name | endswith(".tar.xz")) | .browser_download_url' |
-        head -n1
+        jq -r '[.assets[] | select(.name | startswith("adw-gtk3") and endswith(".tar.xz"))][0].browser_download_url // empty'
     )"
 
     [[ -n "$ADW_URL" && "$ADW_URL" != "null" ]] ||
@@ -318,7 +317,9 @@ if [[ "$INSTALL_ADW_GTK3" == 1 ]]; then
     tar -xJf "$ADW_ARCHIVE" -C "$THEMES_DIR"
     rm -rf "$TMP_ADW_DIR"
 
-    chown -R "$TARGET_USER:$TARGET_USER" "$THEMES_DIR"
+    chown -R "$TARGET_USER:$TARGET_USER" \
+        "$THEMES_DIR/adw-gtk3" \
+        "$THEMES_DIR/adw-gtk3-dark"
 
     # Upstream recommends these theme extensions for GTK3 Flatpak apps.
     flatpak remote-add --if-not-exists \
@@ -369,6 +370,7 @@ enable_service elogind
 enable_service bluetoothd
 enable_service tlp
 enable_service tlp-pd
+enable_service polkitd
 
 # NetworkManager is the sole network manager.
 disable_service dhcpcd
@@ -421,7 +423,14 @@ if [[ "$INSTALL_INCONSOLATA_NERD_FONT" == 1 ]]; then
 fi
 
 # Prefer Inconsolata Nerd Font Mono whenever an application requests monospace.
-cat > "$USER_HOME/.config/fontconfig/fonts.conf" <<'EOF'
+FONT_CONF="$USER_HOME/.config/fontconfig/fonts.conf"
+
+if [[ -e "$FONT_CONF" ]]; then
+    cp -a "$FONT_CONF" \
+        "$FONT_CONF.backup.$(date +%Y%m%d-%H%M%S)"
+fi
+
+cat > "$FONT_CONF" <<'EOF'
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
 <fontconfig>
@@ -486,7 +495,6 @@ fi
 # ---------------------------------------------------------------------------
 
 NOCTALIA_CFG="$USER_HOME/.config/noctalia/config.toml"
-NOCTALIA_TEMPLATES="$USER_HOME/.config/noctalia/templates.toml"
 
 if [[ -e "$NOCTALIA_CFG" ]]; then
     cp -a "$NOCTALIA_CFG" \
@@ -528,13 +536,8 @@ action = "lock_and_suspend"
 enabled = true
 EOF
 
-# Keep app theming in a separate dotfile so Noctalia's GUI-managed state does
-# not have to own these choices.
-cat > "$NOCTALIA_TEMPLATES" <<'EOF'
-[theme.templates]
-enable_builtin_templates = true
-builtin_ids = ["alacritty", "gtk3", "gtk4"]
-EOF
+# Builtin GTK3/GTK4 and Alacritty theme templates are enabled by default, so
+# no templates override file is written.
 
 # ---------------------------------------------------------------------------
 # Session helper
@@ -579,8 +582,16 @@ fi
 # --daemon returns after Noctalia has initialized.
 noctalia --daemon
 
-# Apply GTK/Alacritty templates selected in ~/.config/noctalia/templates.toml.
-noctalia msg templates-apply >/dev/null 2>&1 || true
+# Apply GTK/Alacritty templates selected in ~/.config/noctalia/config.toml.
+# Retry briefly until the daemon's IPC is accepting commands.
+i=0
+while [ "$i" -lt 20 ]; do
+    if noctalia msg templates-apply >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.1
+    i=$((i + 1))
+done
 EOF
 
 chmod 755 "$SESSION_HELPER"
@@ -683,10 +694,14 @@ m = re.search(r'(\n\s*xkb\s*\{\s*\n)', text)
 if not m:
     raise SystemExit("Could not find xkb block in Niri default config.")
 
+# Match the existing indentation so the inserted lines sit flush with
+# whatever depth the default config uses for the xkb block.
+indent = re.match(r'\n(\s*)xkb', m.group(1)).group(1)
+
 new_xkb = (
     m.group(1)
-    + '            layout "br"\n'
-    + '            variant "thinkpad"\n'
+    + f'{indent}    layout "br"\n'
+    + f'{indent}    variant "thinkpad"\n'
 )
 
 text = text[:m.start()] + new_xkb + text[m.end():]
@@ -719,9 +734,6 @@ for old, new in {
     'XF86AudioLowerVolume allow-when-locked=true { spawn-sh "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.1-"; }':
         'XF86AudioLowerVolume allow-when-locked=true { spawn "noctalia" "msg" "volume-down"; }',
 
-    'XF86AudioMute allow-when-locked=true { spawn-sh "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"; }':
-        'XF86AudioMute allow-when-locked=true { spawn "noctalia" "msg" "volume-mute"; }',
-
     'XF86MonBrightnessUp allow-when-locked=true { spawn "brightnessctl" "--class=backlight" "set" "+10%"; }':
         'XF86MonBrightnessUp allow-when-locked=true { spawn "noctalia" "msg" "brightness-up"; }',
 
@@ -729,6 +741,15 @@ for old, new in {
         'XF86MonBrightnessDown allow-when-locked=true { spawn "noctalia" "msg" "brightness-down"; }',
 }.items():
     replace_once(old, new, required=False)
+
+# The default config pads XF86AudioMute with extra spaces, so match
+# whitespace-tolerantly instead of via the exact-string table above.
+text, _ = re.subn(
+    r'XF86AudioMute\s+allow-when-locked=true \{ spawn-sh "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"; \}',
+    'XF86AudioMute allow-when-locked=true { spawn "noctalia" "msg" "volume-mute"; }',
+    text,
+    count=1,
+)
 
 # Add Noctalia bindings inside the one existing binds {} block.
 extra_binds = """binds {
