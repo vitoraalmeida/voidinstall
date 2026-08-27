@@ -387,6 +387,10 @@ XBPS_ARCH=x86_64 xbps-install -Sy -y \
     git \
     rsync
 
+log "Pinning repository mirror for the installed system"
+mkdir -p "$MNT/etc/xbps.d"
+printf 'repository=%s\n' "$REPO" > "$MNT/etc/xbps.d/00-repository.conf"
+
 log "Binding pseudo-filesystems for chroot"
 for fs in dev proc sys; do
     mount --rbind "/$fs" "$MNT/$fs"
@@ -1080,6 +1084,9 @@ grep -q 'subvol=@swap' "$MNT/etc/fstab" ||
 
 grep -q 'resume_offset=' "$MNT/etc/default/grub" ||
     die "resume_offset missing from GRUB kernel command line."
+
+grep -q "^repository=" "$MNT/etc/xbps.d/00-repository.conf" ||
+    die "Pinned repository mirror missing from /etc/xbps.d."
 
 sbverify \
     --cert "$KEYDIR/db.crt" \
