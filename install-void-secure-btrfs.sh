@@ -402,6 +402,14 @@ LUKS_UUID="$(cryptsetup luksUUID "$CRYPT")"
 [[ -n "$BTRFS_UUID" && -n "$ESP_UUID" && -n "$LUKS_UUID" ]] ||
     die "Unable to determine filesystem UUIDs."
 
+log "Writing crypttab"
+# The initramfs crypttab is what makes dracut feed /boot/volume.key (embedded
+# in the initramfs via install_items) to cryptsetup, unlocking the root
+# mapping without asking for the passphrase a second time.
+cat > "$MNT/etc/crypttab" <<EOF
+cryptroot UUID=$LUKS_UUID /boot/volume.key luks
+EOF
+
 log "Writing fstab"
 cat > "$MNT/etc/fstab" <<EOF
 # filesystem          mountpoint       type   options                              dump pass
@@ -647,7 +655,7 @@ log "Configuring dracut for LUKS1, Btrfs and hibernation"
 mkdir -p "$MNT/etc/dracut.conf.d"
 cat > "$MNT/etc/dracut.conf.d/10-cryptroot.conf" <<'EOF'
 add_dracutmodules+=" crypt btrfs resume "
-install_items+=" /boot/volume.key "
+install_items+=" /boot/volume.key /etc/crypttab "
 hostonly="yes"
 EOF
 
@@ -659,7 +667,7 @@ else
     printf '\nGRUB_ENABLE_CRYPTODISK=y\n' >> "$MNT/etc/default/grub"
 fi
 
-KERNEL_CMDLINE="loglevel=4 rd.luks.uuid=luks-$LUKS_UUID rd.luks.key=/boot/volume.key root=UUID=$BTRFS_UUID rootflags=subvol=@ resume=UUID=$BTRFS_UUID resume_offset=$RESUME_OFFSET rw"
+KERNEL_CMDLINE="loglevel=4 rd.luks.uuid=luks-$LUKS_UUID root=UUID=$BTRFS_UUID rootflags=subvol=@ resume=UUID=$BTRFS_UUID resume_offset=$RESUME_OFFSET rw"
 
 if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' "$MNT/etc/default/grub"; then
     sed -i \

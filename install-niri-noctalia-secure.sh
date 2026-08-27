@@ -1,50 +1,46 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# install-niri-noctalia.sh
+# install-niri-noctalia-secure.sh
 #
-# Desktop layer for the secure Void base installation built previously.
+# Desktop layer for the secure Void base installation.
 #
 # Target:
 #   Void Linux x86_64 glibc + runit
-#   Lenovo ThinkPad P15 Gen 1
-#   Intel iGPU + NVIDIA Quadro T1000 4 GB
+#   Niri + Noctalia v5
 #
 # Installs/configures:
 #   - Niri + Noctalia v5
-#   - Intel as the normal Niri renderer
-#   - NVIDIA proprietary driver + PRIME offload (`prime-run`)
-#   - Steam/Proton and 32-bit NVIDIA/Vulkan libraries
+#   - Intel/Mesa graphics stack
 #   - PipeWire + WirePlumber + Bluetooth audio
 #   - NetworkManager, BlueZ, UPower
 #   - elogind lid/suspend/hibernate handling
 #   - Noctalia lock screen + idle policy
-#   - TLP + tlp-pd (no competing power-profiles-daemon)
-#   - portals, gnome-keyring, polkit, automount
-#   - Kitty, Firefox, Nautilus, MPV
+#   - TLP + tlp-pd + tlp-rdw
+#   - XDG portals, gnome-keyring, polkit, automount
+#   - Alacritty, Brave (Flatpak), Nautilus, MPV
+#   - GTK integration helpers and Noctalia GTK/Alacritty templates
+#   - Inconsolata Nerd Font Mono
 #   - PT-BR ThinkPad XKB: br(thinkpad)
-#   - DKMS signing with the custom Secure Boot db key from the base installer
 #
-# Deliberately does NOT:
-#   - install a display manager
-#   - bind the T1000 to vfio-pci
-#   - install swaylock/swayidle/mako/waybar/rofi/blueman/nm-applet
+# Deliberately does NOT install:
+#   - NVIDIA drivers / PRIME tooling
+#   - Steam / gaming libraries
+#   - qemu / libvirt / virt-manager / VFIO tooling
+#   - a display manager
+#   - swaylock / swayidle / mako / waybar / rofi / blueman / nm-applet
 #     because Noctalia covers those desktop-facing functions
 #
 # Usage:
-#   sudo USERNAME=vitor ./install-niri-noctalia.sh
+#   sudo USERNAME=vitor ./install-niri-noctalia-secure.sh
 #
-# Optional:
-#   INSTALL_STEAM=1             # default
-#   INSTALL_VIRTUALIZATION=0    # set 1 for qemu/libvirt/virt-manager
-#   FORCE_INTEL_RENDERER=1      # default
-#
-# Noctalia v5 on Void is supplied by the community repository documented by
-# Noctalia. Third-party repositories should be reviewed according to your
-# trust requirements.
+# Optional environment variables:
+#   INSTALL_BRAVE=1
+#   INSTALL_INCONSOLATA_NERD_FONT=1
+#   FORCE_INTEL_RENDERER=1
 
-INSTALL_STEAM="${INSTALL_STEAM:-1}"
-INSTALL_VIRTUALIZATION="${INSTALL_VIRTUALIZATION:-0}"
+INSTALL_BRAVE="${INSTALL_BRAVE:-1}"
+INSTALL_INCONSOLATA_NERD_FONT="${INSTALL_INCONSOLATA_NERD_FONT:-1}"
 FORCE_INTEL_RENDERER="${FORCE_INTEL_RENDERER:-1}"
 
 log()  { printf '\n==> %s\n' "$*"; }
@@ -58,6 +54,7 @@ TARGET_USER="${USERNAME:-${SUDO_USER:-}}"
 if [[ -z "$TARGET_USER" || "$TARGET_USER" == root ]]; then
     TARGET_USER="$(awk -F: '$3 >= 1000 && $3 < 65534 {print $1; exit}' /etc/passwd)"
 fi
+
 [[ -n "$TARGET_USER" ]] || die "Could not determine the desktop user."
 id "$TARGET_USER" >/dev/null 2>&1 || die "No such user: $TARGET_USER"
 
@@ -88,48 +85,55 @@ install_required() {
     xbps-install -Sy "$@"
 }
 
-install_optional() {
-    local pkg="$1"
-    if xbps-query -Rs "^${pkg}-[0-9]" 2>/dev/null | grep -q .; then
-        xbps-install -Sy "$pkg"
-    else
-        warn "Optional package unavailable: $pkg"
+append_once() {
+    local file="$1"
+    local marker="$2"
+    local content="$3"
+
+    touch "$file"
+    if ! grep -Fq "$marker" "$file"; then
+        printf '\n%s\n' "$content" >> "$file"
     fi
 }
 
-# Snapshot the base before changing it.
+# ---------------------------------------------------------------------------
+# Snapshot before changes
+# ---------------------------------------------------------------------------
+
 if command -v system-snapshot >/dev/null 2>&1; then
     log "Creating paired / + /var snapshot before desktop installation"
     system-snapshot "before-niri-noctalia-desktop"
 fi
 
 # ---------------------------------------------------------------------------
-# Void repositories
+# Noctalia repository
 # ---------------------------------------------------------------------------
-
-log "Enabling official nonfree and multilib repositories"
-xbps-install -Sy \
-    void-repo-nonfree \
-    void-repo-multilib \
-    void-repo-multilib-nonfree
-xbps-install -S
 
 log "Adding the Noctalia-documented Void community repository"
 cat > /etc/xbps.d/10-voiders-community.conf <<'EOF'
 repository=https://repo.voiders.dev
 EOF
+
 xbps-install -S
 
 # ---------------------------------------------------------------------------
-# Niri / session / portals / storage integration
+# Core utilities + Niri / session / portals / storage integration
 # ---------------------------------------------------------------------------
 
 install_required \
     dbus \
     NetworkManager \
     python3 \
+    git \
+    curl \
+    wget \
+    jq \
+    unzip \
     niri \
+    noctalia \
+    sdbus-c++ \
     xwayland-satellite \
+    xkeyboard-config \
     elogind \
     polkit \
     upower \
@@ -149,8 +153,6 @@ install_required \
     playerctl \
     wev
 
-install_required noctalia sdbus-c++
-
 # ---------------------------------------------------------------------------
 # Audio + Bluetooth
 # ---------------------------------------------------------------------------
@@ -158,12 +160,17 @@ install_required noctalia sdbus-c++
 install_required \
     pipewire \
     wireplumber \
+    wireplumber-elogind \
     alsa-pipewire \
+    alsa-utils \
     libspa-bluetooth \
+    rtkit \
+    pulseaudio-utils \
     pavucontrol \
     bluez
 
 log "Configuring PipeWire/WirePlumber"
+
 mkdir -p /etc/pipewire/pipewire.conf.d /etc/alsa/conf.d
 
 [[ -e /usr/share/examples/wireplumber/10-wireplumber.conf ]] && \
@@ -186,10 +193,13 @@ mkdir -p /etc/pipewire/pipewire.conf.d /etc/alsa/conf.d
 # Laptop power management
 # ---------------------------------------------------------------------------
 
-install_required tlp tlp-pd
+install_required \
+    tlp \
+    tlp-pd \
+    tlp-rdw
 
-# One policy engine only. tlp-pd exposes the power-profile API while TLP owns
-# the actual laptop tuning.
+# TLP owns the actual laptop tuning. tlp-pd provides the power-profile API
+# consumed by desktop shells such as Noctalia.
 if xbps-query power-profiles-daemon >/dev/null 2>&1; then
     warn "Removing power-profiles-daemon to avoid competing with TLP/tlp-pd."
     xbps-remove -Ry power-profiles-daemon || true
@@ -206,13 +216,13 @@ CPU_ENERGY_PERF_POLICY_ON_BAT=balance_power
 WIFI_PWR_ON_AC=off
 WIFI_PWR_ON_BAT=on
 
-# Let unused PCIe devices enter runtime power management.
 RUNTIME_PM_ON_AC=on
 RUNTIME_PM_ON_BAT=auto
 EOF
 
 # elogind, rather than acpid, owns lid/power/suspend events.
 disable_service acpid
+
 mkdir -p /etc/elogind/logind.conf.d
 cat > /etc/elogind/logind.conf.d/10-thinkpad.conf <<'EOF'
 [Login]
@@ -226,7 +236,7 @@ HandleLidSwitchDocked=ignore
 EOF
 
 # ---------------------------------------------------------------------------
-# Intel graphics
+# Intel / Mesa graphics
 # ---------------------------------------------------------------------------
 
 install_required \
@@ -237,84 +247,18 @@ install_required \
     glxinfo
 
 # ---------------------------------------------------------------------------
-# Secure-Boot-aware NVIDIA DKMS + PRIME
-# ---------------------------------------------------------------------------
-
-install_required dkms linux-headers openssl
-
-SB_KEY="/root/secureboot-keys/db.key"
-SB_CERT="/root/secureboot-keys/db.crt"
-SB_DER="/root/secureboot-keys/db-module.der"
-
-if [[ -r "$SB_KEY" && -r "$SB_CERT" ]]; then
-    log "Configuring DKMS signing using the Secure Boot db key"
-    openssl x509 -in "$SB_CERT" -outform DER -out "$SB_DER"
-    chmod 600 "$SB_KEY"
-    chmod 644 "$SB_DER"
-
-    mkdir -p /etc/dkms/framework.conf.d
-    cat > /etc/dkms/framework.conf.d/10-secureboot.conf <<EOF
-mok_signing_key="$SB_KEY"
-mok_certificate="$SB_DER"
-sign_file="/lib/modules/\$kernelver/build/scripts/sign-file"
-EOF
-else
-    warn "Secure Boot signing keys from the base installer were not found."
-    warn "If Secure Boot is enabled, unsigned NVIDIA DKMS modules may be rejected."
-fi
-
-install_required nvidia
-
-# These services can intentionally keep the dGPU alive. PRIME does not require
-# them for this laptop use case.
-disable_service nvidia-persistenced
-disable_service nvidia-powerd
-
-cat > /etc/modprobe.d/90-nvidia-thinkpad.conf <<'EOF'
-# Modern Wayland/Niri.
-options nvidia_drm modeset=1 fbdev=1
-
-# Request Turing dynamic runtime D3 power management.  Some P15 Gen 1 firmware
-# configurations report RTD3 as unsupported; PRIME offload still works normally.
-options nvidia NVreg_DynamicPowerManagement=0x02
-EOF
-
-mkdir -p /etc/udev/rules.d
-cat > /etc/udev/rules.d/80-nvidia-runtime-pm.rules <<'EOF'
-ACTION=="add",  SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", TEST=="power/control", ATTR{power/control}="auto"
-ACTION=="bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", TEST=="power/control", ATTR{power/control}="auto"
-EOF
-
-# ---------------------------------------------------------------------------
-# Steam / Proton
-# ---------------------------------------------------------------------------
-
-if [[ "$INSTALL_STEAM" == 1 ]]; then
-    install_required \
-        libgcc-32bit \
-        libstdc++-32bit \
-        libdrm-32bit \
-        libglvnd-32bit \
-        mesa-dri-32bit \
-        mesa-vulkan-intel-32bit \
-        vulkan-loader-32bit \
-        nvidia-libs-32bit \
-        steam
-
-    install_optional gamescope
-    install_optional MangoHud
-fi
-
-# ---------------------------------------------------------------------------
-# Applications + fonts
+# Applications, Flatpak, GTK helpers and fonts
 # ---------------------------------------------------------------------------
 
 install_required \
-    kitty \
-    firefox \
+    alacritty \
     nautilus \
     mpv \
     imv \
+    flatpak \
+    nwg-look \
+    dconf \
+    gsettings-desktop-schemas \
     fontconfig \
     dejavu-fonts-ttf \
     noto-fonts-ttf \
@@ -322,20 +266,11 @@ install_required \
     font-firacode
 
 # ---------------------------------------------------------------------------
-# Optional future VFIO tooling (no vfio-pci binding here)
-# ---------------------------------------------------------------------------
-
-if [[ "$INSTALL_VIRTUALIZATION" == 1 ]]; then
-    install_required qemu libvirt virt-manager
-    enable_service libvirtd
-    getent group libvirt >/dev/null 2>&1 && usermod -aG libvirt "$TARGET_USER"
-fi
-
-# ---------------------------------------------------------------------------
-# runit services
+# System services
 # ---------------------------------------------------------------------------
 
 log "Enabling system services"
+
 enable_service dbus
 enable_service NetworkManager
 enable_service elogind
@@ -352,23 +287,112 @@ for grp in audio video input network; do
 done
 
 # ---------------------------------------------------------------------------
-# User setup
+# User directories
 # ---------------------------------------------------------------------------
 
-runuser -u "$TARGET_USER" -- env HOME="$USER_HOME" xdg-user-dirs-update || true
+runuser -u "$TARGET_USER" -- \
+    env HOME="$USER_HOME" \
+    xdg-user-dirs-update || true
 
 mkdir -p \
     "$USER_HOME/.config/niri" \
     "$USER_HOME/.config/noctalia" \
-    "$USER_HOME/.local/bin"
+    "$USER_HOME/.config/fontconfig" \
+    "$USER_HOME/.config/alacritty" \
+    "$USER_HOME/.local/bin" \
+    "$USER_HOME/.local/share/fonts"
 
-# Noctalia handles lock + idle itself, so no swaylock/swayidle are needed.
+# ---------------------------------------------------------------------------
+# Inconsolata Nerd Font Mono
+# ---------------------------------------------------------------------------
+
+if [[ "$INSTALL_INCONSOLATA_NERD_FONT" == 1 ]]; then
+    log "Installing Inconsolata Nerd Font"
+
+    TMP_FONT_ZIP="$(mktemp --suffix=.zip)"
+    FONT_DIR="$USER_HOME/.local/share/fonts/InconsolataNerdFont"
+
+    mkdir -p "$FONT_DIR"
+
+    curl -fL \
+        https://github.com/ryanoasis/nerd-fonts/releases/latest/download/Inconsolata.zip \
+        -o "$TMP_FONT_ZIP"
+
+    unzip -q -o "$TMP_FONT_ZIP" '*.ttf' -d "$FONT_DIR"
+    rm -f "$TMP_FONT_ZIP"
+
+    chown -R "$TARGET_USER:$TARGET_USER" "$FONT_DIR"
+
+    runuser -u "$TARGET_USER" -- \
+        env HOME="$USER_HOME" \
+        fc-cache -f
+fi
+
+# Prefer Inconsolata Nerd Font Mono whenever an application requests monospace.
+cat > "$USER_HOME/.config/fontconfig/fonts.conf" <<'EOF'
+<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
+<fontconfig>
+  <alias>
+    <family>monospace</family>
+    <prefer>
+      <family>Inconsolata Nerd Font Mono</family>
+    </prefer>
+  </alias>
+</fontconfig>
+EOF
+
+chown -R "$TARGET_USER:$TARGET_USER" "$USER_HOME/.config/fontconfig"
+
+# ---------------------------------------------------------------------------
+# Flatpak + Brave
+# ---------------------------------------------------------------------------
+
+if [[ "$INSTALL_BRAVE" == 1 ]]; then
+    log "Installing Brave from Flathub"
+
+    flatpak remote-add --if-not-exists \
+        flathub \
+        https://dl.flathub.org/repo/flathub.flatpakrepo
+
+    flatpak install -y --noninteractive \
+        flathub \
+        com.brave.Browser
+fi
+
+# Ensure Flatpak desktop files are visible to Noctalia and other launchers
+# even on a minimal runit login environment.
+PROFILE_MARKER="# --- Flatpak XDG exports (Niri/Noctalia installer) ---"
+PROFILE_CONTENT='
+# --- Flatpak XDG exports (Niri/Noctalia installer) ---
+export XDG_DATA_DIRS="$HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+# --- end Flatpak XDG exports ---'
+
+append_once "$USER_HOME/.profile" "$PROFILE_MARKER" "$PROFILE_CONTENT"
+chown "$TARGET_USER:$TARGET_USER" "$USER_HOME/.profile"
+
+# ---------------------------------------------------------------------------
+# Noctalia configuration
+# ---------------------------------------------------------------------------
+
 NOCTALIA_CFG="$USER_HOME/.config/noctalia/config.toml"
+NOCTALIA_TEMPLATES="$USER_HOME/.config/noctalia/templates.toml"
+
 if [[ -e "$NOCTALIA_CFG" ]]; then
-    cp -a "$NOCTALIA_CFG" "${NOCTALIA_CFG}.backup.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$NOCTALIA_CFG" \
+        "${NOCTALIA_CFG}.backup.$(date +%Y%m%d-%H%M%S)"
 fi
 
 cat > "$NOCTALIA_CFG" <<'EOF'
+[shell]
+font_family = "Inconsolata Nerd Font Mono"
+niri_overview_type_to_launch_enabled = true
+
+[theme]
+mode = "dark"
+source = "builtin"
+builtin = "Noctalia"
+
 [lockscreen]
 enabled = true
 lock_before_suspend = true
@@ -392,13 +416,22 @@ enabled = true
 timeout = 1800
 action = "lock_and_suspend"
 enabled = true
-
-[shell]
-niri_overview_type_to_launch_enabled = true
 EOF
 
-# Session helper launched by Niri. It starts the user audio stack and shell.
+# Keep app theming in a separate dotfile so Noctalia's GUI-managed state does
+# not have to own these choices.
+cat > "$NOCTALIA_TEMPLATES" <<'EOF'
+[theme.templates]
+enable_builtin_templates = true
+builtin_ids = ["alacritty", "gtk3", "gtk4"]
+EOF
+
+# ---------------------------------------------------------------------------
+# Session helper
+# ---------------------------------------------------------------------------
+
 SESSION_HELPER="$USER_HOME/.local/bin/niri-session-services"
+
 cat > "$SESSION_HELPER" <<'EOF'
 #!/bin/sh
 
@@ -408,25 +441,38 @@ dbus-update-activation-environment \
     XDG_CURRENT_DESKTOP \
     XDG_SESSION_DESKTOP \
     XDG_SESSION_TYPE \
-    XDG_RUNTIME_DIR 2>/dev/null || true
+    XDG_RUNTIME_DIR \
+    XDG_DATA_DIRS 2>/dev/null || true
 
-if ! pgrep -x pipewire >/dev/null 2>&1; then
-    pipewire >/tmp/pipewire-"$UID".log 2>&1 &
+# Void's PipeWire example snippets start WirePlumber and the PulseAudio
+# compatibility server from the main PipeWire process.
+USER_UID="$(id -u)"
+
+if ! pgrep -u "$USER_UID" -x pipewire >/dev/null 2>&1; then
+    pipewire >/tmp/pipewire-"$USER_UID".log 2>&1 &
 fi
 
 i=0
 while [ "$i" -lt 50 ] && \
-      [ ! -S "${XDG_RUNTIME_DIR:-/run/user/$UID}/pipewire-0" ]; do
+      [ ! -S "${XDG_RUNTIME_DIR:-/run/user/$USER_UID}/pipewire-0" ]; do
     sleep 0.1
     i=$((i + 1))
 done
 
-if ! pgrep -u "$UID" -x gnome-keyring-daemon >/dev/null 2>&1; then
-    gnome-keyring-daemon --start --components=secrets >/dev/null 2>&1 || true
+if ! pgrep -u "$USER_UID" -x gnome-keyring-daemon >/dev/null 2>&1; then
+    gnome-keyring-daemon \
+        --start \
+        --components=secrets \
+        >/dev/null 2>&1 || true
 fi
 
-exec noctalia --daemon
+# --daemon returns after Noctalia has initialized.
+noctalia --daemon
+
+# Apply GTK/Alacritty templates selected in ~/.config/noctalia/templates.toml.
+noctalia msg templates-apply >/dev/null 2>&1 || true
 EOF
+
 chmod 755 "$SESSION_HELPER"
 
 # ---------------------------------------------------------------------------
@@ -462,13 +508,17 @@ fi
     die "Could not locate the Niri default config."
 
 NIRI_CFG="$USER_HOME/.config/niri/config.kdl"
+
 if [[ -e "$NIRI_CFG" ]]; then
-    cp -a "$NIRI_CFG" "${NIRI_CFG}.backup.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$NIRI_CFG" \
+        "${NIRI_CFG}.backup.$(date +%Y%m%d-%H%M%S)"
 fi
+
 cp "$NIRI_DEFAULT" "$NIRI_CFG"
 
 # Detect the Intel render node by PCI vendor ID.
 INTEL_RENDER_NODE=""
+
 if [[ "$FORCE_INTEL_RENDERER" == 1 ]]; then
     for sysnode in /sys/class/drm/renderD*; do
         [[ -e "$sysnode/device/vendor" ]] || continue
@@ -479,11 +529,13 @@ if [[ "$FORCE_INTEL_RENDERER" == 1 ]]; then
 
         for bypath in /dev/dri/by-path/*-render; do
             [[ -e "$bypath" ]] || continue
+
             if [[ "$(readlink -f "$bypath")" == "$(readlink -f "$devnode")" ]]; then
                 INTEL_RENDER_NODE="$bypath"
                 break
             fi
         done
+
         break
     done
 
@@ -503,13 +555,16 @@ from pathlib import Path
 path = Path(os.environ["PATCH_NIRI_CFG"])
 session_helper = os.environ["PATCH_SESSION_HELPER"]
 intel_render = os.environ.get("PATCH_INTEL_RENDER", "")
+
 text = path.read_text()
 
 def replace_once(old, new, required=True):
     global text
     if old not in text:
         if required:
-            raise SystemExit(f"Niri default config changed; expected text missing: {old!r}")
+            raise SystemExit(
+                f"Niri default config changed; expected text missing: {old!r}"
+            )
         return
     text = text.replace(old, new, 1)
 
@@ -523,6 +578,7 @@ new_xkb = (
     + '            layout "br"\n'
     + '            variant "thinkpad"\n'
 )
+
 text = text[:m.start()] + new_xkb + text[m.end():]
 
 # No Waybar: Noctalia is the desktop shell.
@@ -531,37 +587,40 @@ replace_once(
     f'spawn-at-startup "{session_helper}"'
 )
 
-replace_once(
-    'Mod+T hotkey-overlay-title="Open a Terminal: alacritty" { spawn "alacritty"; }',
-    'Mod+T hotkey-overlay-title="Open a Terminal: kitty" { spawn "kitty"; }'
-)
+# Niri's current default terminal is already Alacritty, so no terminal
+# replacement is needed.
+
 replace_once(
     'Mod+D hotkey-overlay-title="Run an Application: fuzzel" { spawn "fuzzel"; }',
     'Mod+D hotkey-overlay-title="Application Launcher: Noctalia" { spawn "noctalia" "msg" "panel-toggle" "launcher"; }'
 )
+
 replace_once(
     'Super+Alt+L hotkey-overlay-title="Lock the Screen: swaylock" { spawn "swaylock"; }',
     'Super+Alt+L hotkey-overlay-title="Lock: Noctalia" { spawn "noctalia" "msg" "session" "lock"; }'
 )
 
-# Multimedia-line formatting changes between Niri releases.  These replacements
-# are cosmetic integrations with Noctalia; the stock wpctl/brightnessctl binds
-# are still functional if a future default cannot be matched exactly.
+# Multimedia-line formatting changes between Niri releases. These replacements
+# are optional because the stock wpctl/brightnessctl bindings still work.
 for old, new in {
     'XF86AudioRaiseVolume allow-when-locked=true { spawn-sh "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.1+ -l 1.0"; }':
         'XF86AudioRaiseVolume allow-when-locked=true { spawn "noctalia" "msg" "volume-up"; }',
+
     'XF86AudioLowerVolume allow-when-locked=true { spawn-sh "wpctl set-volume @DEFAULT_AUDIO_SINK@ 0.1-"; }':
         'XF86AudioLowerVolume allow-when-locked=true { spawn "noctalia" "msg" "volume-down"; }',
+
     'XF86AudioMute allow-when-locked=true { spawn-sh "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle"; }':
         'XF86AudioMute allow-when-locked=true { spawn "noctalia" "msg" "volume-mute"; }',
+
     'XF86MonBrightnessUp allow-when-locked=true { spawn "brightnessctl" "--class=backlight" "set" "+10%"; }':
         'XF86MonBrightnessUp allow-when-locked=true { spawn "noctalia" "msg" "brightness-up"; }',
+
     'XF86MonBrightnessDown allow-when-locked=true { spawn "brightnessctl" "--class=backlight" "set" "10%-"; }':
         'XF86MonBrightnessDown allow-when-locked=true { spawn "noctalia" "msg" "brightness-down"; }',
 }.items():
     replace_once(old, new, required=False)
 
-# Add bindings inside the ONE existing binds {} block.
+# Add Noctalia bindings inside the one existing binds {} block.
 extra_binds = """binds {
     // Noctalia integration.
     Mod+Space hotkey-overlay-title="Noctalia Launcher" { spawn "noctalia" "msg" "panel-toggle" "launcher"; }
@@ -571,13 +630,13 @@ extra_binds = """binds {
     Mod+Shift+Escape hotkey-overlay-title="Session Menu" { spawn "noctalia" "msg" "panel-toggle" "session"; }
     Super+Alt+H hotkey-overlay-title="Lock and Hibernate" { spawn-sh "noctalia msg session lock; sleep 1; loginctl hibernate"; }
 """
+
 replace_once("binds {", extra_binds)
 
-# Current Niri defaults contain only a commented rounded-corners example.
-# Add the active rule once.
+# Desktop integration.
 text += r"""
 
-// Desktop integration added by install-niri-noctalia.sh.
+// Desktop integration added by install-niri-noctalia-secure.sh.
 window-rule {
     geometry-corner-radius 12
     clip-to-geometry true
@@ -593,29 +652,40 @@ debug {
 """
 
 if intel_render:
-    text += f'    // Keep normal compositor rendering on Intel.\n'
+    text += '    // Keep normal compositor rendering on Intel.\n'
     text += f'    render-drm-device "{intel_render}"\n'
 
 text += "}\n"
+
 path.write_text(text)
 PY
 
 chown -R "$TARGET_USER:$TARGET_USER" \
     "$USER_HOME/.config/niri" \
     "$USER_HOME/.config/noctalia" \
+    "$USER_HOME/.config/alacritty" \
     "$USER_HOME/.local"
 
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
 log "Validating generated Niri config"
+
 runuser -u "$TARGET_USER" -- \
-    env HOME="$USER_HOME" XDG_CONFIG_HOME="$USER_HOME/.config" \
+    env \
+        HOME="$USER_HOME" \
+        XDG_CONFIG_HOME="$USER_HOME/.config" \
     niri validate ||
     die "niri validate failed; inspect $NIRI_CFG"
 
-# Noctalia validator availability can differ across package revisions.
 if noctalia config validate --help >/dev/null 2>&1; then
     log "Validating Noctalia config"
+
     runuser -u "$TARGET_USER" -- \
-        env HOME="$USER_HOME" XDG_CONFIG_HOME="$USER_HOME/.config" \
+        env \
+            HOME="$USER_HOME" \
+            XDG_CONFIG_HOME="$USER_HOME/.config" \
         noctalia config validate ||
         warn "Noctalia reported a config issue; inspect $NOCTALIA_CFG."
 fi
@@ -638,87 +708,93 @@ export XDG_CURRENT_DESKTOP=niri
 export XDG_SESSION_DESKTOP=niri
 export XDG_SESSION_TYPE=wayland
 
-# On runit there is no systemd/dinit user manager. Give the graphical session
-# its own D-Bus session bus and let Niri perform its normal --session setup.
+export XDG_DATA_DIRS="$HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+# On runit there is no systemd user manager. Give the graphical session its
+# own D-Bus session bus and let Niri perform its normal --session setup.
 exec dbus-run-session -- niri --session
 EOF
+
 chmod 755 /usr/local/bin/start-niri
 
-# Browser default; failure is harmless before the first graphical login.
-runuser -u "$TARGET_USER" -- \
-    env HOME="$USER_HOME" \
-    xdg-settings set default-web-browser firefox.desktop 2>/dev/null || true
-
 # ---------------------------------------------------------------------------
-# Rebuild boot artifacts after NVIDIA installation
+# Default browser
 # ---------------------------------------------------------------------------
 
-log "Regenerating initramfs"
-dracut --regenerate-all --force
+if [[ "$INSTALL_BRAVE" == 1 ]]; then
+    log "Setting Brave as the default browser"
 
-if [[ -x /usr/local/sbin/secureboot-refresh-grub ]]; then
-    log "Refreshing and re-signing the standalone Secure Boot GRUB image"
-    /usr/local/sbin/secureboot-refresh-grub
+    runuser -u "$TARGET_USER" -- \
+        env \
+            HOME="$USER_HOME" \
+            XDG_DATA_DIRS="$USER_HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share:/usr/share" \
+        xdg-mime default com.brave.Browser.desktop text/html || true
+
+    runuser -u "$TARGET_USER" -- \
+        env \
+            HOME="$USER_HOME" \
+            XDG_DATA_DIRS="$USER_HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share:/usr/share" \
+        xdg-mime default com.brave.Browser.desktop x-scheme-handler/http || true
+
+    runuser -u "$TARGET_USER" -- \
+        env \
+            HOME="$USER_HOME" \
+            XDG_DATA_DIRS="$USER_HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share:/usr/share" \
+        xdg-mime default com.brave.Browser.desktop x-scheme-handler/https || true
 fi
 
-if modinfo nvidia >/dev/null 2>&1; then
-    signer="$(modinfo -F signer nvidia 2>/dev/null || true)"
-    if [[ -n "$signer" ]]; then
-        printf '\nNVIDIA module signer: %s\n' "$signer"
-    elif [[ -r "$SB_KEY" ]]; then
-        warn "The NVIDIA module is present but modinfo did not report a signer."
-        warn "Verify DKMS module signing before enabling/relying on Secure Boot."
-    fi
-fi
+# ---------------------------------------------------------------------------
+# Final snapshot
+# ---------------------------------------------------------------------------
 
 if command -v system-snapshot >/dev/null 2>&1; then
     log "Creating paired / + /var snapshot after desktop installation"
     system-snapshot "niri-noctalia-desktop-installed"
 fi
 
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
 printf '\n'
 printf '====================================================================\n'
 printf ' NIRI + NOCTALIA INSTALLATION COMPLETE\n'
 printf '====================================================================\n\n'
+
 printf 'User:          %s\n' "$TARGET_USER"
 printf 'Desktop:       Niri + Noctalia v5\n'
-printf 'Terminal:      Kitty\n'
-printf 'Browser:       Firefox\n'
+printf 'Terminal:      Alacritty\n'
+printf 'Browser:       %s\n' "$([[ "$INSTALL_BRAVE" == 1 ]] && echo 'Brave (Flatpak)' || echo 'not installed')"
 printf 'Files:         Nautilus\n'
 printf 'Audio:         PipeWire + WirePlumber\n'
 printf 'Bluetooth:     BlueZ + PipeWire Bluetooth audio\n'
 printf 'Network:       NetworkManager\n'
-printf 'Power:         TLP + tlp-pd + UPower\n'
+printf 'Power:         TLP + tlp-pd + tlp-rdw + UPower\n'
 printf 'Session:       elogind\n'
 printf 'Lock/idle:     Noctalia\n'
 printf 'Keyboard:      br(thinkpad)\n'
-printf 'Niri renderer: %s\n' "${INTEL_RENDER_NODE:-automatic}"
-printf 'NVIDIA:        PRIME offload; not bound to VFIO\n'
-printf 'Steam:         %s\n\n' "$([[ "$INSTALL_STEAM" == 1 ]] && echo installed || echo skipped)"
+printf 'Monospace:     Inconsolata Nerd Font Mono\n'
+printf 'Niri renderer: %s\n\n' "${INTEL_RENDER_NODE:-automatic}"
 
 printf 'After reboot:\n'
 printf '  1. Log in on the TTY as %s\n' "$TARGET_USER"
 printf '  2. Run: start-niri\n\n'
 
-printf 'PRIME / gaming:\n'
-printf '  prime-run program\n'
-if [[ "$INSTALL_STEAM" == 1 ]]; then
-    printf '  Steam launch option: prime-run %%command%%\n'
-fi
-printf '  nvidia-smi\n\n'
-
 printf 'Useful checks:\n'
 printf '  niri validate\n'
 printf '  niri msg outputs\n'
 printf '  noctalia msg --help\n'
+printf '  noctalia theme --list-templates\n'
+printf '  fc-match monospace\n'
+printf '  wpctl status\n'
+printf '  pactl info\n'
 printf '  tlp-stat -s\n'
 printf '  loginctl hibernate\n\n'
 
 printf 'Notes:\n'
-printf '  - The internal desktop renderer is Intel when detection succeeded.\n'
-printf '  - HDMI on this P15 may keep the T1000 awake because the port is dGPU-wired.\n'
-printf '  - If an external high-refresh display has cross-GPU presentation issues,\n'
-printf '    remove render-drm-device from ~/.config/niri/config.kdl and let Niri\n'
-printf '    select the renderer automatically.\n'
+printf '  - No NVIDIA, Steam or virtualization packages were installed.\n'
 printf '  - No display manager was installed.\n'
-printf '  - VFIO can be added later; this script does not reserve the T1000 for a VM.\n'
+printf '  - Noctalia handles launcher, notifications, lock screen and idle policy.\n'
+printf '  - GTK3/GTK4 and Alacritty Noctalia templates are enabled.\n'
+printf '  - If GTK theming needs adw-gtk3, install that theme separately;\n'
+printf '    it is not currently an official Void package.\n'
