@@ -501,20 +501,26 @@ chmod 644 "$MNT/etc/profile.d/thinkpad-xkb.sh"
 
 log "Configuring Ethernet and Wi-Fi through NetworkManager"
 # NetworkManager is the sole network-management service.
-rm -f \
-    "$MNT/var/service/dhcpcd" \
-    "$MNT/var/service/wpa_supplicant"
+#
+# /var/service is a symlink to /run/runit/runsvdir/current, which only exists
+# on a booted system (and, through the /run bind mount, would resolve into the
+# live ISO, not the target). Enable services directly in the target's default
+# runsvdir, which is what /var/service points at after boot.
+RUNSVDIR="$MNT/etc/runit/runsvdir/default"
+mkdir -p "$RUNSVDIR"
 
-mkdir -p "$MNT/var/service"
+rm -f \
+    "$RUNSVDIR/dhcpcd" \
+    "$RUNSVDIR/wpa_supplicant"
 
 ln -sfn /etc/sv/dbus \
-    "$MNT/var/service/dbus"
+    "$RUNSVDIR/dbus"
 
 ln -sfn /etc/sv/NetworkManager \
-    "$MNT/var/service/NetworkManager"
+    "$RUNSVDIR/NetworkManager"
 
 ln -sfn /etc/sv/cronie \
-    "$MNT/var/service/cronie"
+    "$RUNSVDIR/cronie"
 
 
 log "Creating administrative user: $USERNAME"
@@ -1103,10 +1109,10 @@ test -x "$MNT/etc/sv/dbus/run" ||
 chroot "$MNT" sh -c 'test -e /var/service/dbus' ||
     die "dbus service not activated in /var/service."
 
-test -e "$MNT/var/service/dhcpcd" &&
+test -e "$MNT/etc/runit/runsvdir/default/dhcpcd" &&
     die "dhcpcd service is activated; it would conflict with NetworkManager."
 
-test -e "$MNT/var/service/wpa_supplicant" &&
+test -e "$MNT/etc/runit/runsvdir/default/wpa_supplicant" &&
     die "wpa_supplicant service is activated; NetworkManager manages it via dbus."
 
 grep -q 'subvol=@snapshots' "$MNT/etc/fstab" ||
