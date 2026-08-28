@@ -42,14 +42,6 @@ die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 command -v xbps-install >/dev/null 2>&1 ||
     die "xbps not found: this script must run inside the installed Void system."
 
-if xbps-query musl >/dev/null 2>&1; then
-    die "This is a Void musl system; this script expects Void x86_64 glibc."
-fi
-
-if ! ldd --version 2>&1 | head -n1 | grep -Eqi 'glibc|GNU libc'; then
-    die "This script expects Void x86_64 glibc, not musl."
-fi
-
 install_required() {
     log "Installing packages: $*"
     xbps-install -Sy "$@"

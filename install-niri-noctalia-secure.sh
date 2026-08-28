@@ -59,15 +59,6 @@ die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 command -v xbps-install >/dev/null 2>&1 ||
     die "xbps not found: this script must run inside the installed Void system, not on the host or live ISO."
 
-if xbps-query musl >/dev/null 2>&1; then
-    die "This is a Void musl system; this script expects Void x86_64 glibc."
-fi
-
-if ! ldd --version 2>&1 | head -n1 | grep -Eqi 'glibc|GNU libc'; then
-    LDD_BANNER="$(ldd --version 2>&1 | head -n1 || true)"
-    die "This script expects Void x86_64 glibc, not musl. ldd reported: ${LDD_BANNER:-<nothing>}"
-fi
-
 TARGET_USER="${USERNAME:-${SUDO_USER:-}}"
 if [[ -z "$TARGET_USER" || "$TARGET_USER" == root ]]; then
     TARGET_USER="$(awk -F: '$3 >= 1000 && $3 < 65534 {print $1; exit}' /etc/passwd)"
