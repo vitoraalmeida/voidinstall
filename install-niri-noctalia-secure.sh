@@ -91,7 +91,13 @@ enable_service() {
 }
 
 disable_service() {
-    rm -f "/var/service/$1"
+    local svc="$1"
+    if [[ -e "/var/service/$svc" || -L "/var/service/$svc" ]]; then
+        # Stop the service if runit is live; the || true covers running this
+        # in environments where runsvdir is not supervising (e.g. chroot).
+        sv down "/var/service/$svc" 2>/dev/null || true
+        rm -f "/var/service/$svc"
+    fi
 }
 
 install_required() {
@@ -128,7 +134,9 @@ cat > /etc/xbps.d/10-voiders-community.conf <<'EOF'
 repository=https://repo.voiders.dev
 EOF
 
-xbps-install -S
+warn "The first repository sync asks to trust the repo.voiders.dev RSA key; verify the fingerprint before accepting."
+xbps-install -S ||
+    die "Syncing the voiders community repository failed; check /etc/xbps.d/10-voiders-community.conf."
 
 # ---------------------------------------------------------------------------
 # Core utilities + Niri / session / portals / storage integration
@@ -432,14 +440,17 @@ if [[ "$INSTALL_INCONSOLATA_NERD_FONT" == 1 ]]; then
 fi
 
 # Prefer Inconsolata Nerd Font Mono whenever an application requests monospace.
-FONT_CONF="$USER_HOME/.config/fontconfig/fonts.conf"
+# Only written when the font was installed, so fontconfig never points at a
+# missing family.
+if [[ "$INSTALL_INCONSOLATA_NERD_FONT" == 1 ]]; then
+    FONT_CONF="$USER_HOME/.config/fontconfig/fonts.conf"
 
-if [[ -e "$FONT_CONF" ]]; then
-    cp -a "$FONT_CONF" \
-        "$FONT_CONF.backup.$(date +%Y%m%d-%H%M%S)"
-fi
+    if [[ -e "$FONT_CONF" ]]; then
+        cp -a "$FONT_CONF" \
+            "$FONT_CONF.backup.$(date +%Y%m%d-%H%M%S)"
+    fi
 
-cat > "$FONT_CONF" <<'EOF'
+    cat > "$FONT_CONF" <<'EOF'
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
 <fontconfig>
@@ -452,7 +463,8 @@ cat > "$FONT_CONF" <<'EOF'
 </fontconfig>
 EOF
 
-chown -R "$TARGET_USER:$TARGET_USER" "$USER_HOME/.config/fontconfig"
+    chown -R "$TARGET_USER:$TARGET_USER" "$USER_HOME/.config/fontconfig"
+fi
 
 # ---------------------------------------------------------------------------
 # Flatpak + Brave
@@ -547,6 +559,28 @@ EOF
 
 # Builtin GTK3/GTK4 and Alacritty theme templates are enabled by default, so
 # no templates override file is written.
+
+# ---------------------------------------------------------------------------
+# PAM: unlock gnome-keyring on TTY login
+# ---------------------------------------------------------------------------
+
+log "Configuring gnome-keyring PAM unlock for TTY login"
+
+# Without PAM integration the keyring stays locked after a TTY login, so
+# Brave, Wi-Fi secrets and the session helper's keyring start all prompt or
+# fail. The auth line must run after pam_unix (appending keeps that order);
+# the session line starts the daemon with the login.
+[[ -e /usr/lib/security/pam_gnome_keyring.so ]] ||
+    die "gnome-keyring PAM module missing from /usr/lib/security."
+
+LOGIN_PAM=/etc/pam.d/login
+touch "$LOGIN_PAM"
+
+append_once "$LOGIN_PAM" "pam_gnome_keyring.so" \
+    "auth       optional    pam_gnome_keyring.so"
+
+append_once "$LOGIN_PAM" "pam_gnome_keyring.so auto_start" \
+    "session     optional    pam_gnome_keyring.so auto_start"
 
 # ---------------------------------------------------------------------------
 # Session helper

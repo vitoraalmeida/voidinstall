@@ -9,6 +9,8 @@ set -Eeuo pipefail
 # - Void Linux x86_64 glibc, no desktop
 # - UEFI
 # - Custom Secure Boot with locally generated PK/KEK/db keys
+# - Kernels signed with the db key via a kernel hook (no-op while Secure
+#   Boot is disabled; required for GRUB 2.12 UEFI LoadImage verification)
 # - Only the EFI System Partition is plaintext
 # - LUKS1 for the whole Linux system
 # - /boot inside LUKS1
@@ -260,7 +262,8 @@ if [[ "$NONINTERACTIVE" == "yes" ]]; then
     printf 'ASSUME_ERASE=yes: skipping interactive confirmation.\n'
 else
     printf 'Type exactly: ERASE %s\n> ' "$DISK"
-    read -r confirmation
+    read -r confirmation ||
+        die "Could not read confirmation. No destructive action was performed."
     [[ "$confirmation" == "ERASE $DISK" ]] ||
         die "Confirmation did not match. No destructive action was performed."
 fi
@@ -388,8 +391,10 @@ XBPS_ARCH=x86_64 xbps-install -Sy -y \
     rsync
 
 log "Pinning repository mirror for the installed system"
+# Same basename as Void's stock /usr/share/xbps.d/00-repository-main.conf so
+# /etc/xbps.d overrides the default repository instead of adding a second one.
 mkdir -p "$MNT/etc/xbps.d"
-printf 'repository=%s\n' "$REPO" > "$MNT/etc/xbps.d/00-repository.conf"
+printf 'repository=%s\n' "$REPO" > "$MNT/etc/xbps.d/00-repository-main.conf"
 
 log "Binding pseudo-filesystems for chroot"
 for fs in dev proc sys; do
@@ -688,6 +693,14 @@ install_items+=" /boot/volume.key /etc/crypttab "
 hostonly="yes"
 EOF
 
+# In hostonly mode dracut looks for a resume device on the kernel command line
+# visible at build time; the live ISO's /proc/cmdline has no resume=. Feeding
+# the parameters through kernel_cmdline (stored in the initramfs'
+# /etc/cmdline.d) makes the resume module include hibernation support.
+cat > "$MNT/etc/dracut.conf.d/20-resume.conf" <<EOF
+kernel_cmdline+=" resume=UUID=$BTRFS_UUID resume_offset=$RESUME_OFFSET "
+EOF
+
 log "Configuring encrypted /boot and resume parameters"
 if grep -q '^GRUB_ENABLE_CRYPTODISK=' "$MNT/etc/default/grub"; then
     sed -i 's/^GRUB_ENABLE_CRYPTODISK=.*/GRUB_ENABLE_CRYPTODISK=y/' \
@@ -936,6 +949,31 @@ echo "GRUB regenerated and signed."
 EOF
 chmod 700 "$MNT/usr/local/sbin/secureboot-refresh-grub"
 
+log "Installing kernel signing hook for Secure Boot"
+# xbps runs /etc/kernel.d/post-install/* with the kernel version as $1 on every
+# kernel install/upgrade/reconfigure. GRUB 2.12 loads PE kernels through UEFI
+# LoadImage, so the firmware verifies the kernel against the enrolled db key.
+# With Secure Boot disabled the signatures are simply ignored.
+mkdir -p "$MNT/etc/kernel.d/post-install"
+cat > "$MNT/etc/kernel.d/post-install/30-sbsign" <<'EOF'
+#!/bin/sh
+set -eu
+
+VERSION="$1"
+KEYDIR=/root/secureboot-keys
+KERNEL="/boot/vmlinuz-${VERSION}"
+
+[ -f "$KERNEL" ] || exit 0
+
+sbsign --key "$KEYDIR/db.key" --cert "$KEYDIR/db.crt" \
+    --output "${KERNEL}.signed" "$KERNEL"
+mv "${KERNEL}.signed" "$KERNEL"
+
+sbverify --cert "$KEYDIR/db.crt" "$KERNEL" >/dev/null
+echo "Secure Boot: signed $KERNEL"
+EOF
+chmod 755 "$MNT/etc/kernel.d/post-install/30-sbsign"
+
 log "Installing snapshot-aware XBPS update wrapper"
 cat > "$MNT/usr/local/sbin/xbps-snapshot-update" <<'EOF'
 #!/bin/sh
@@ -1043,6 +1081,9 @@ test -f "$MNT/etc/snapper/configs/var" ||
 test -f "$MNT/swap/swapfile" ||
     die "Swapfile missing."
 
+test -x "$MNT/etc/kernel.d/post-install/30-sbsign" ||
+    die "Kernel signing hook missing."
+
 # Network invariants: NetworkManager is the sole DHCP/DNS manager, so a
 # missing package or activation symlink must abort the install instead of
 # producing a system that boots without any working network manager.
@@ -1085,7 +1126,7 @@ grep -q 'subvol=@swap' "$MNT/etc/fstab" ||
 grep -q 'resume_offset=' "$MNT/etc/default/grub" ||
     die "resume_offset missing from GRUB kernel command line."
 
-grep -q "^repository=" "$MNT/etc/xbps.d/00-repository.conf" ||
+grep -q "^repository=" "$MNT/etc/xbps.d/00-repository-main.conf" ||
     die "Pinned repository mirror missing from /etc/xbps.d."
 
 sbverify \
