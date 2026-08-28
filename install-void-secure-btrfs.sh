@@ -9,8 +9,9 @@ set -Eeuo pipefail
 # - Void Linux x86_64 glibc, no desktop
 # - UEFI
 # - Custom Secure Boot with locally generated PK/KEK/db keys
-# - Kernels signed with the db key via a kernel hook (no-op while Secure
-#   Boot is disabled; required for GRUB 2.12 UEFI LoadImage verification)
+# - Kernels signed with the db key via Void's sbsigntool kernel hook (no-op
+#   while Secure Boot is disabled; required for GRUB 2.12 UEFI LoadImage
+#   verification)
 # - Only the EFI System Partition is plaintext
 # - LUKS1 for the whole Linux system
 # - /boot inside LUKS1
@@ -462,6 +463,8 @@ if ! grep -q '^en_US.UTF-8 UTF-8' "$MNT/etc/default/libc-locales"; then
     printf '\nen_US.UTF-8 UTF-8\n' >> "$MNT/etc/default/libc-locales"
 fi
 
+[[ -f "$MNT/usr/share/zoneinfo/$TIMEZONE" ]] ||
+    die "Unknown TIMEZONE: $TIMEZONE"
 ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$MNT/etc/localtime"
 chroot "$MNT" xbps-reconfigure -f glibc-locales
 
@@ -770,6 +773,11 @@ generate_key PK  "$HOSTNAME Secure Boot Platform Key"
 generate_key KEK "$HOSTNAME Secure Boot KEK"
 generate_key db  "$HOSTNAME Secure Boot db"
 
+# Void's sbsigntool kernel hook signs with db.key/db.crt and refuses to run
+# unless both are root-owned and not readable by group or others. The public
+# copies on the ESP stay 644.
+chmod 600 "$KEYDIR/db.crt"
+
 PK_GUID="$(cat /proc/sys/kernel/random/uuid)"
 KEK_GUID="$(cat /proc/sys/kernel/random/uuid)"
 DB_GUID="$(cat /proc/sys/kernel/random/uuid)"
@@ -949,30 +957,20 @@ echo "GRUB regenerated and signed."
 EOF
 chmod 700 "$MNT/usr/local/sbin/secureboot-refresh-grub"
 
-log "Installing kernel signing hook for Secure Boot"
-# xbps runs /etc/kernel.d/post-install/* with the kernel version as $1 on every
-# kernel install/upgrade/reconfigure. GRUB 2.12 loads PE kernels through UEFI
-# LoadImage, so the firmware verifies the kernel against the enrolled db key.
-# With Secure Boot disabled the signatures are simply ignored.
-mkdir -p "$MNT/etc/kernel.d/post-install"
-cat > "$MNT/etc/kernel.d/post-install/30-sbsign" <<'EOF'
-#!/bin/sh
-set -eu
-
-VERSION="$1"
-KEYDIR=/root/secureboot-keys
-KERNEL="/boot/vmlinuz-${VERSION}"
-
-[ -f "$KERNEL" ] || exit 0
-
-sbsign --key "$KEYDIR/db.key" --cert "$KEYDIR/db.crt" \
-    --output "${KERNEL}.signed" "$KERNEL"
-mv "${KERNEL}.signed" "$KERNEL"
-
-sbverify --cert "$KEYDIR/db.crt" "$KERNEL" >/dev/null
-echo "Secure Boot: signed $KERNEL"
+log "Configuring kernel signing for Secure Boot"
+# Void's sbsigntool package ships a kernel hook (/etc/kernel.d/post-install/
+# 40-sbsigntool) that signs /boot/vmlinuz-$VERSION with sbsign on every
+# kernel install/upgrade/reconfigure when this config file exists. It is
+# idempotent (skips already-signed kernels) and verifies the signature after
+# signing. GRUB 2.12 loads PE kernels through UEFI LoadImage, so the
+# firmware verifies the kernel against the enrolled db key; with Secure Boot
+# disabled the signatures are simply ignored.
+cat > "$MNT/etc/default/sbsigntool-kernel-hook" <<'EOF'
+SBSIGN_EFI_KERNEL=1
+EFI_KEY_FILE=/root/secureboot-keys/db.key
+EFI_CERT_FILE=/root/secureboot-keys/db.crt
 EOF
-chmod 755 "$MNT/etc/kernel.d/post-install/30-sbsign"
+chmod 644 "$MNT/etc/default/sbsigntool-kernel-hook"
 
 log "Installing snapshot-aware XBPS update wrapper"
 cat > "$MNT/usr/local/sbin/xbps-snapshot-update" <<'EOF'
@@ -1081,8 +1079,11 @@ test -f "$MNT/etc/snapper/configs/var" ||
 test -f "$MNT/swap/swapfile" ||
     die "Swapfile missing."
 
-test -x "$MNT/etc/kernel.d/post-install/30-sbsign" ||
-    die "Kernel signing hook missing."
+test -f "$MNT/etc/default/sbsigntool-kernel-hook" ||
+    die "Kernel signing configuration missing."
+
+grep -q '^SBSIGN_EFI_KERNEL=1' "$MNT/etc/default/sbsigntool-kernel-hook" ||
+    die "sbsigntool kernel signing is not enabled."
 
 # Network invariants: NetworkManager is the sole DHCP/DNS manager, so a
 # missing package or activation symlink must abort the install instead of
