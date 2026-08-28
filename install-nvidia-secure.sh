@@ -36,6 +36,8 @@ log()  { printf '\n==> %s\n' "$*"; }
 warn() { printf '\nWARNING: %s\n' "$*" >&2; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
+trap 'printf "\nERROR: %s: command failed at line %d: %s\n" "$0" "$LINENO" "$(sed -n "${LINENO}p" "$0")" >&2' ERR
+
 [[ $EUID -eq 0 ]] || die "Run as root (normally via sudo)."
 [[ "$(uname -m)" == "x86_64" ]] || die "This script targets x86_64."
 
@@ -245,6 +247,7 @@ fi
 # ---------------------------------------------------------------------------
 
 log "Installing NVIDIA runtime PM udev rules"
+mkdir -p /etc/udev/rules.d
 cat > /etc/udev/rules.d/80-nvidia-pm.rules <<'EOF'
 # Enable runtime PM for NVIDIA VGA/3D controller devices on bind
 ACTION=="bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000", TEST=="power/control", ATTR{power/control}="auto"
