@@ -513,6 +513,9 @@ rm -f \
     "$RUNSVDIR/dhcpcd" \
     "$RUNSVDIR/wpa_supplicant"
 
+ln -sfn /etc/sv/udevd \
+    "$RUNSVDIR/udevd"
+
 ln -sfn /etc/sv/dbus \
     "$RUNSVDIR/dbus"
 

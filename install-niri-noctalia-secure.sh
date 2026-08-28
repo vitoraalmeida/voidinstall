@@ -372,6 +372,7 @@ fi
 
 log "Enabling system services"
 
+enable_service udevd
 enable_service dbus
 enable_service NetworkManager
 enable_service elogind
@@ -379,6 +380,12 @@ enable_service bluetoothd
 enable_service tlp
 enable_service tlp-pd
 enable_service polkitd
+
+if [[ ! -e /run/udev/control ]] && command -v sv >/dev/null 2>&1; then
+    sv up udevd
+    [[ -e /run/udev/control ]] ||
+        die "udevd is not running; elogind and input hotplug require it. Check 'sv status udevd'."
+fi
 
 # NetworkManager is the sole network manager.
 disable_service dhcpcd

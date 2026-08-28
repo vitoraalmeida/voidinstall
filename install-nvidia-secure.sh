@@ -255,6 +255,16 @@ ACTION=="unbind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x0300
 ACTION=="unbind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030200", TEST=="power/control", ATTR{power/control}="on"
 EOF
 
+if [[ ! -e /run/udev/control ]]; then
+    if [[ -d /etc/sv/udevd && -d /var/service ]]; then
+        log "udevd is not running; enabling the udevd runit service"
+        ln -sfn /etc/sv/udevd /var/service/udevd
+        sv up udevd
+    fi
+    [[ -e /run/udev/control ]] ||
+        die "udevd is not running; enable it with 'ln -sfn /etc/sv/udevd /var/service/udevd && sv up udevd' and re-run."
+fi
+
 udevadm control --reload
 
 # ---------------------------------------------------------------------------
