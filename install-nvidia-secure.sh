@@ -28,15 +28,52 @@ set -Eeuo pipefail
 #   NVIDIA_COMPOSITOR=1     render the niri session on the NVIDIA GPU
 #                           (default 0: compositor on Intel, dGPU via prime-run)
 #   INSTALL_NVIDIA_VAAPI=1  install nvidia-vaapi-driver (NVDEC VA-API backend)
+#   NVIDIA_RTD3=0           force-disable runtime power management (RTD3)
+#   NVIDIA_RTD3=1           force-enable RTD3 (the bare-metal default)
+#                           Auto-detection: inside a QEMU/KVM VM (matched via
+#                           DMI sys_vendor) RTD3 is disabled by default - a
+#                           suspended GPU also drops its HDMI audio function,
+#                           which makes passthrough VM audio cycle up and down.
+#
+# VM usage (GPU passthrough):
+#   When using this script inside a libvirt/QEMU VM, create the VM with the
+#   following or the NVIDIA layer will not work correctly:
+#     - UEFI (OVMF) firmware. If Secure Boot is enabled, the VM firmware must
+#       have the base install's db key enrolled, or keep SB disabled (the
+#       script then warns that modules are unsigned).
+#     - BOTH GPU functions as VFIO hostdevs: the VGA controller (class 0x0300)
+#       AND its HDMI audio function (class 0x0403). Passing only the VGA part
+#       leaves the guest with no sound path.
+#     - USB hostdevs matched by vendor/product, never by bus/device number:
+#       bus/device re-enumerate on host reboot and the VM then fails to start
+#       with "Did not find matching USB device".
+#     - No emulated audio backend tied to a host user session (e.g. PipeWire
+#       when QEMU runs as root) - either run QEMU as the desktop user or omit
+#       the emulated sound device and rely on HDMI audio.
 
 NVIDIA_COMPOSITOR="${NVIDIA_COMPOSITOR:-0}"
 INSTALL_NVIDIA_VAAPI="${INSTALL_NVIDIA_VAAPI:-0}"
+# Resolved after the helper functions below: explicit value wins, then VM
+# auto-detection, bare-metal default is RTD3 enabled.
+NVIDIA_RTD3="${NVIDIA_RTD3:-}"
 
 log()  { printf '\n==> %s\n' "$*"; }
 warn() { printf '\nWARNING: %s\n' "$*" >&2; }
 die()  { printf '\nERROR: %s\n' "$*" >&2; exit 1; }
 
 trap 'printf "\nERROR: %s: command failed at line %d: %s\n" "$0" "$LINENO" "$(sed -n "${LINENO}p" "$0")" >&2' ERR
+
+# RTD3 mode: explicit override > QEMU/DMI auto-detection > bare-metal default.
+# RTD3 suspends the dGPU when idle, which also removes its HDMI audio function:
+# desirable on bare metal, breaks audio in GPU-passthrough VMs.
+if [[ -n "$NVIDIA_RTD3" ]]; then
+    log "NVIDIA_RTD3 explicitly set to $NVIDIA_RTD3"
+elif grep -qi qemu /sys/class/dmi/id/sys_vendor 2>/dev/null; then
+    NVIDIA_RTD3=0
+    log "VM detected (QEMU/DMI) - disabling RTD3 for stable GPU-passthrough audio"
+else
+    NVIDIA_RTD3=1
+fi
 
 [[ $EUID -eq 0 ]] || die "Run as root (normally via sudo)."
 [[ "$(uname -m)" == "x86_64" ]] || die "This script targets x86_64."
@@ -189,10 +226,15 @@ fi
 # Driver options, KMS and initramfs configuration
 # ---------------------------------------------------------------------------
 
-log "Configuring NVIDIA module options (modeset, fbdev, runtime PM)"
-cat > /etc/modprobe.d/nvidia-secure.conf <<'EOF'
+log "Configuring NVIDIA module options (modeset, fbdev, runtime PM: RTD3 $([[ "$NVIDIA_RTD3" == 1 ]] && echo on || echo off))"
+if [[ "$NVIDIA_RTD3" == 1 ]]; then
+    RTD3_OPTION="NVreg_DynamicPowerManagement=0x02"
+else
+    RTD3_OPTION="NVreg_DynamicPowerManagement=0x00"
+fi
+cat > /etc/modprobe.d/nvidia-secure.conf <<EOF
 options nvidia-drm modeset=1 fbdev=1
-options nvidia NVreg_DynamicPowerManagement=0x02
+options nvidia $RTD3_OPTION
 EOF
 
 log "Configuring dracut for NVIDIA early KMS"
@@ -248,7 +290,8 @@ fi
 
 log "Installing NVIDIA runtime PM udev rules"
 mkdir -p /etc/udev/rules.d
-cat > /etc/udev/rules.d/80-nvidia-pm.rules <<'EOF'
+if [[ "$NVIDIA_RTD3" == 1 ]]; then
+    cat > /etc/udev/rules.d/80-nvidia-pm.rules <<'EOF'
 # Enable runtime PM for NVIDIA VGA/3D controller devices on bind
 ACTION=="bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000", TEST=="power/control", ATTR{power/control}="auto"
 ACTION=="bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030200", TEST=="power/control", ATTR{power/control}="auto"
@@ -257,6 +300,10 @@ ACTION=="bind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030200
 ACTION=="unbind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030000", TEST=="power/control", ATTR{power/control}="on"
 ACTION=="unbind", SUBSYSTEM=="pci", ATTR{vendor}=="0x10de", ATTR{class}=="0x030200", TEST=="power/control", ATTR{power/control}="on"
 EOF
+else
+    rm -f /etc/udev/rules.d/80-nvidia-pm.rules
+    log "NVIDIA_RTD3=0: RTD3 udev rules removed"
+fi
 
 if [[ ! -e /run/udev/control ]]; then
     if [[ -d /etc/sv/udevd && -d /var/service ]]; then
