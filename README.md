@@ -30,7 +30,7 @@ Void live ISO (UEFI mode)
 Run from the official Void x86_64 glibc live ISO booted in UEFI mode:
 
 ```sh
-DISK=/dev/nvme0n1 USERNAME=user HOSTNAME=host \
+DISK=/dev/nvme0n1 USERNAME=<your-user> HOSTNAME=<your-host> \
 TIMEZONE=America/Bahia ./install-void-secure-btrfs.sh
 ```
 
@@ -43,7 +43,7 @@ What it does:
 - Encrypted swapfile sized to RAM + hibernation (`resume`/`resume_offset`)
 - Snapper with paired `/` + `/var` snapshots and hourly timeline
 - NetworkManager, cronie, br-abnt2 keyboard (incl. ThinkPad `/` key fix)
-- Admin user with wheel/sudo (`USERNAME` defaults to `user`)
+- Admin user with wheel/sudo (`USERNAME` is required, `HOSTNAME` defaults to `void`)
 
 A fully non-interactive variant exists (`ASSUME_ERASE=yes` + the three
 password variables) — see the header of the script.

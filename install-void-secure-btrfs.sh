@@ -59,8 +59,8 @@ set -Eeuo pipefail
 # Usage from official Void x86_64 glibc live ISO booted in UEFI mode:
 #
 #   DISK=/dev/nvme0n1 \
-#   USERNAME=user \
-#   HOSTNAME=host \
+#   USERNAME=<your-user> \
+#   HOSTNAME=<your-host> \
 #   TIMEZONE=America/Bahia \
 #   SWAP_GB=32 \
 #   ./install-void-secure-btrfs.sh
@@ -82,8 +82,8 @@ set -Eeuo pipefail
 # Prefer invoking from a wrapper so the values stay out of shell history.
 
 DISK="${DISK:-/dev/nvme0n1}"
-USERNAME="${USERNAME:-user}"
-HOSTNAME="${HOSTNAME:-host}"
+USERNAME="${USERNAME:-}"
+HOSTNAME="${HOSTNAME:-void}"
 TIMEZONE="${TIMEZONE:-America/Bahia}"
 REPO="${REPO:-https://repo-fastly.voidlinux.org/current}"
 MNT="${MNT:-/mnt}"
@@ -193,6 +193,9 @@ for cmd in \
 do
     require_cmd "$cmd"
 done
+
+[[ -n "$USERNAME" ]] ||
+    die "USERNAME is required (e.g. USERNAME=myuser)."
 
 case "$USERNAME" in
     ''|*[!a-z0-9_-]*|[0-9]*) die "Invalid USERNAME: $USERNAME" ;;
