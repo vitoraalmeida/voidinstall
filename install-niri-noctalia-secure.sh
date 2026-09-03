@@ -22,8 +22,17 @@ set -Eeuo pipefail
 #   - adw-gtk3 from the latest upstream release
 #   - nwg-look built from the official upstream repository
 #   - GTK integration helpers and Noctalia GTK/Alacritty templates
-#   - Inconsolata Nerd Font Mono
+#   - Iosevka Nerd Font
 #   - PT-BR ThinkPad XKB: br(thinkpad)
+#
+# Machine-specific integration (this setup targets one ThinkPad P15 Gen 1):
+#   With APPLY_DOTFILES=1 (default), the dotfiles repository is cloned to
+#   ~/dotfiles (override with DOTFILES_DIR / DOTFILES_REPO) if missing, and
+#   its install.sh is executed at the end — after the generated configs, so
+#   the personal Stow configs always win. The dotfiles integration also:
+#   - installs every package from dotfiles packages/xbps-manual.txt
+#   - installs every Flatpak app from dotfiles packages/flatpak-apps.txt
+#   - copies the dotfiles wallpapers into ~/Pictures/Wallpapers
 #
 # Deliberately does NOT install:
 #   - NVIDIA drivers / PRIME tooling
@@ -38,16 +47,22 @@ set -Eeuo pipefail
 #
 # Optional environment variables:
 #   INSTALL_BRAVE=1
-#   INSTALL_INCONSOLATA_NERD_FONT=1
+#   INSTALL_IOSEVKA_NERD_FONT=1
 #   INSTALL_ADW_GTK3=1
 #   INSTALL_NWG_LOOK=1
 #   FORCE_INTEL_RENDERER=1
+#   DOTFILES_DIR=~/dotfiles
+#   DOTFILES_REPO=https://github.com/vitoraalmeida/dotfiles.git
+#   APPLY_DOTFILES=1   (clone if missing and run dotfiles install.sh at the end)
 
 INSTALL_BRAVE="${INSTALL_BRAVE:-1}"
-INSTALL_INCONSOLATA_NERD_FONT="${INSTALL_INCONSOLATA_NERD_FONT:-1}"
+INSTALL_IOSEVKA_NERD_FONT="${INSTALL_IOSEVKA_NERD_FONT:-1}"
 INSTALL_ADW_GTK3="${INSTALL_ADW_GTK3:-1}"
 INSTALL_NWG_LOOK="${INSTALL_NWG_LOOK:-1}"
 FORCE_INTEL_RENDERER="${FORCE_INTEL_RENDERER:-1}"
+DOTFILES_DIR="${DOTFILES_DIR:-}"
+DOTFILES_REPO="${DOTFILES_REPO:-https://github.com/vitoraalmeida/dotfiles.git}"
+APPLY_DOTFILES="${APPLY_DOTFILES:-1}"
 
 log()  { printf '\n==> %s\n' "$*"; }
 warn() { printf '\nWARNING: %s\n' "$*" >&2; }
@@ -69,6 +84,8 @@ id "$TARGET_USER" >/dev/null 2>&1 || die "No such user: $TARGET_USER"
 
 USER_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 [[ -d "$USER_HOME" ]] || die "Home directory not found: $USER_HOME"
+
+DOTFILES_DIR="${DOTFILES_DIR:-$USER_HOME/dotfiles}"
 
 enable_service() {
     local svc="$1"
@@ -412,19 +429,19 @@ mkdir -p \
     "$USER_HOME/.local/share/fonts"
 
 # ---------------------------------------------------------------------------
-# Inconsolata Nerd Font Mono
+# Iosevka Nerd Font
 # ---------------------------------------------------------------------------
 
-if [[ "$INSTALL_INCONSOLATA_NERD_FONT" == 1 ]]; then
-    log "Installing Inconsolata Nerd Font"
+if [[ "$INSTALL_IOSEVKA_NERD_FONT" == 1 ]]; then
+    log "Installing Iosevka Nerd Font"
 
     TMP_FONT_ZIP="$(mktemp --suffix=.zip)"
-    FONT_DIR="$USER_HOME/.local/share/fonts/InconsolataNerdFont"
+    FONT_DIR="$USER_HOME/.local/share/fonts/IosevkaNerdFont"
 
     mkdir -p "$FONT_DIR"
 
     curl -fL \
-        https://github.com/ryanoasis/nerd-fonts/releases/latest/download/Inconsolata.zip \
+        https://github.com/ryanoasis/nerd-fonts/releases/latest/download/Iosevka.zip \
         -o "$TMP_FONT_ZIP"
 
     unzip -q -o "$TMP_FONT_ZIP" '*.ttf' -d "$FONT_DIR"
@@ -437,10 +454,11 @@ if [[ "$INSTALL_INCONSOLATA_NERD_FONT" == 1 ]]; then
         fc-cache -f
 fi
 
-# Prefer Inconsolata Nerd Font Mono whenever an application requests monospace.
-# Only written when the font was installed, so fontconfig never points at a
-# missing family.
-if [[ "$INSTALL_INCONSOLATA_NERD_FONT" == 1 ]]; then
+# The dotfiles fontconfig prefers Iosevka everywhere (sans-serif, serif and
+# monospace aliases); this file matches it, and the Stow step later overwrites
+# it with the canonical version anyway. Only written when the font was
+# installed, so fontconfig never points at a missing family.
+if [[ "$INSTALL_IOSEVKA_NERD_FONT" == 1 ]]; then
     FONT_CONF="$USER_HOME/.config/fontconfig/fonts.conf"
 
     if [[ -e "$FONT_CONF" ]]; then
@@ -453,9 +471,23 @@ if [[ "$INSTALL_INCONSOLATA_NERD_FONT" == 1 ]]; then
 <!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">
 <fontconfig>
   <alias>
+    <family>sans-serif</family>
+    <prefer>
+      <family>Iosevka Nerd Font</family>
+    </prefer>
+  </alias>
+
+  <alias>
+    <family>serif</family>
+    <prefer>
+      <family>Iosevka Nerd Font</family>
+    </prefer>
+  </alias>
+
+  <alias>
     <family>monospace</family>
     <prefer>
-      <family>Inconsolata Nerd Font Mono</family>
+      <family>Iosevka Nerd Font Mono</family>
     </prefer>
   </alias>
 </fontconfig>
@@ -478,6 +510,69 @@ if [[ "$INSTALL_BRAVE" == 1 ]]; then
     flatpak install -y --noninteractive \
         flathub \
         com.brave.Browser
+fi
+
+# ---------------------------------------------------------------------------
+# Dotfiles repository + machine-specific integration
+# ---------------------------------------------------------------------------
+
+if [[ ! -d "$DOTFILES_DIR" && "$APPLY_DOTFILES" == 1 ]]; then
+    log "Cloning the dotfiles repository into $DOTFILES_DIR"
+
+    runuser -u "$TARGET_USER" -- \
+        env HOME="$USER_HOME" \
+        git clone "$DOTFILES_REPO" "$DOTFILES_DIR" ||
+        die "Could not clone $DOTFILES_REPO into $DOTFILES_DIR."
+fi
+
+if [[ -d "$DOTFILES_DIR" ]]; then
+    log "Dotfiles repository found at $DOTFILES_DIR"
+
+    # Stow is required by the dotfiles' own install.sh.
+    install_required stow
+
+    XBPS_MANUAL="$DOTFILES_DIR/packages/xbps-manual.txt"
+
+    if [[ -s "$XBPS_MANUAL" ]]; then
+        mapfile -t DOTFILES_PKGS < <(
+            sed -E 's/-[0-9][0-9.]*_[0-9]+$//' "$XBPS_MANUAL" |
+            sed '/^[[:space:]]*$/d'
+        )
+
+        if ((${#DOTFILES_PKGS[@]} > 0)); then
+            log "Installing the full dotfiles package set (${#DOTFILES_PKGS[@]} packages)"
+            install_required "${DOTFILES_PKGS[@]}"
+        fi
+    else
+        warn "No packages/xbps-manual.txt in $DOTFILES_DIR; skipping the package set."
+    fi
+
+    FLATPAK_LIST="$DOTFILES_DIR/packages/flatpak-apps.txt"
+
+    if [[ -s "$FLATPAK_LIST" ]]; then
+        log "Installing Flatpak apps from $FLATPAK_LIST"
+
+        flatpak remote-add --if-not-exists \
+            flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+
+        while IFS= read -r APP_ID; do
+            [[ -n "$APP_ID" ]] || continue
+            flatpak install -y --noninteractive flathub "$APP_ID" ||
+                warn "Could not install Flatpak app: $APP_ID"
+        done < "$FLATPAK_LIST"
+    fi
+
+    if compgen -G "$DOTFILES_DIR/*.jpg" > /dev/null; then
+        log "Installing dotfiles wallpapers"
+
+        WALLPAPER_DIR="$USER_HOME/Pictures/Wallpapers"
+        mkdir -p "$WALLPAPER_DIR"
+        cp -a "$DOTFILES_DIR"/*.jpg "$WALLPAPER_DIR"/
+        chown -R "$TARGET_USER:$TARGET_USER" "$WALLPAPER_DIR"
+    fi
+else
+    warn "DOTFILES_DIR not found at $DOTFILES_DIR; skipping the machine-specific package set."
 fi
 
 # Ensure Flatpak desktop files are visible to Noctalia and other launchers
@@ -522,7 +617,7 @@ fi
 
 cat > "$NOCTALIA_CFG" <<'EOF'
 [shell]
-font_family = "Inconsolata Nerd Font Mono"
+font_family = "Iosevka Nerd Font Mono"
 niri_overview_type_to_launch_enabled = true
 
 [theme]
@@ -916,6 +1011,23 @@ if [[ "$INSTALL_BRAVE" == 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Dotfiles personal configs (applied last, so they win over the generated ones)
+# ---------------------------------------------------------------------------
+
+if [[ -d "$DOTFILES_DIR" && "$APPLY_DOTFILES" == 1 ]]; then
+    if [[ -x "$DOTFILES_DIR/install.sh" ]]; then
+        log "Applying the dotfiles personal configs (Stow)"
+
+        runuser -u "$TARGET_USER" -- \
+            env HOME="$USER_HOME" \
+            sh "$DOTFILES_DIR/install.sh" ||
+            die "The dotfiles install.sh failed; inspect the output above."
+    else
+        warn "No install.sh in $DOTFILES_DIR; personal configs were not applied."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Final snapshot
 # ---------------------------------------------------------------------------
 
@@ -945,12 +1057,24 @@ printf 'Power:         TLP + tlp-pd + tlp-rdw + UPower\n'
 printf 'Session:       elogind\n'
 printf 'Lock/idle:     Noctalia\n'
 printf 'Keyboard:      br(thinkpad)\n'
-printf 'Monospace:     Inconsolata Nerd Font Mono\n'
-printf 'Niri renderer: %s\n\n' "${INTEL_RENDER_NODE:-automatic}"
+printf 'Monospace:     Iosevka Nerd Font Mono\n'
+printf 'Niri renderer: %s\n' "${INTEL_RENDER_NODE:-automatic}"
+if [[ -d "$DOTFILES_DIR" ]]; then
+    printf 'Dotfiles:      %s\n' "$([[ "$APPLY_DOTFILES" == 1 ]] &&
+        echo "clonados e aplicados ($DOTFILES_DIR)" || echo "clonados em $DOTFILES_DIR (install.sh não rodou)")"
+else
+    printf 'Dotfiles:      não instalados (DOTFILES_REPO=%s)\n' "$DOTFILES_REPO"
+fi
+printf '\n'
 
 printf 'After reboot:\n'
 printf '  1. Log in on the TTY as %s\n' "$TARGET_USER"
-printf '  2. Run: start-niri\n\n'
+if [[ -d "$DOTFILES_DIR" && "$APPLY_DOTFILES" == 1 ]]; then
+    printf '  2. Run: start-niri\n\n'
+else
+    printf '  2. Run: %s/install.sh (personal configs)\n' "$DOTFILES_DIR"
+    printf '  3. Run: start-niri\n\n'
+fi
 
 printf 'Useful checks:\n'
 printf '  niri validate\n'
