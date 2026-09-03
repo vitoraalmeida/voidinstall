@@ -68,7 +68,9 @@ What it does, in order:
    matching `fontconfig/fonts.conf`
 5. **Dotfiles integration** (if `~/dotfiles` is absent it is cloned from
    `DOTFILES_REPO`, default `https://github.com/vitoraalmeida/dotfiles.git`):
-   - installs `stow` + every package from `packages/xbps-manual.txt`
+   - installs `stow` + the root packages from `packages/xbps-roots.txt`
+     (XBPS pulls the rest of the dependency tree; falls back to the
+     auto-captured `packages/xbps-manual.txt` if the roots file is absent)
    - installs every Flatpak app from `packages/flatpak-apps.txt`
    - copies the wallpapers into `~/Pictures/Wallpapers`
 6. Writes the Noctalia config, the `niri-session-services` helper, generates

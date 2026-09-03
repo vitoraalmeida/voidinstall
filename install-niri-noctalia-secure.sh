@@ -30,7 +30,8 @@ set -Eeuo pipefail
 #   ~/dotfiles (override with DOTFILES_DIR / DOTFILES_REPO) if missing, and
 #   its install.sh is executed at the end — after the generated configs, so
 #   the personal Stow configs always win. The dotfiles integration also:
-#   - installs every package from dotfiles packages/xbps-manual.txt
+#   - installs the root packages from dotfiles packages/xbps-roots.txt
+#     (XBPS resolves the rest of the dependency tree)
 #   - installs every Flatpak app from dotfiles packages/flatpak-apps.txt
 #   - copies the dotfiles wallpapers into ~/Pictures/Wallpapers
 #
@@ -531,20 +532,37 @@ if [[ -d "$DOTFILES_DIR" ]]; then
     # Stow is required by the dotfiles' own install.sh.
     install_required stow
 
-    XBPS_MANUAL="$DOTFILES_DIR/packages/xbps-manual.txt"
+    # Root packages only: everything else in the setup is a transitive
+    # dependency that XBPS resolves on its own. Falls back to the
+    # auto-captured manual list when the curated roots file is absent.
+    PKG_LIST="$DOTFILES_DIR/packages/xbps-roots.txt"
 
-    if [[ -s "$XBPS_MANUAL" ]]; then
+    if [[ ! -s "$PKG_LIST" ]]; then
+        PKG_LIST="$DOTFILES_DIR/packages/xbps-manual.txt"
+    fi
+
+    if [[ -s "$PKG_LIST" ]]; then
         mapfile -t DOTFILES_PKGS < <(
-            sed -E 's/-[0-9][0-9.]*_[0-9]+$//' "$XBPS_MANUAL" |
+            sed -E 's/-[0-9][0-9A-Za-z.+~]*_[0-9]+$//' "$PKG_LIST" |
             sed '/^[[:space:]]*$/d'
         )
 
         if ((${#DOTFILES_PKGS[@]} > 0)); then
-            log "Installing the full dotfiles package set (${#DOTFILES_PKGS[@]} packages)"
-            install_required "${DOTFILES_PKGS[@]}"
+            log "Installing the dotfiles package set (${#DOTFILES_PKGS[@]} roots from $(basename "$PKG_LIST"))"
+
+            if ! xbps-install -Sy "${DOTFILES_PKGS[@]}"; then
+                warn "Bulk install failed; retrying package by package."
+                FAILED=()
+                for PKG in "${DOTFILES_PKGS[@]}"; do
+                    xbps-install -Sy "$PKG" || FAILED+=("$PKG")
+                done
+                if ((${#FAILED[@]} > 0)); then
+                    warn "Packages not installed: ${FAILED[*]}"
+                fi
+            fi
         fi
     else
-        warn "No packages/xbps-manual.txt in $DOTFILES_DIR; skipping the package set."
+        warn "No xbps-roots.txt or xbps-manual.txt in $DOTFILES_DIR; skipping the package set."
     fi
 
     FLATPAK_LIST="$DOTFILES_DIR/packages/flatpak-apps.txt"
